@@ -1,5 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AlignLeft, Check, WrapText } from 'lucide-react';
+import {
+  AlignLeft,
+  AlertCircle,
+  Check,
+  CloudCheck,
+  CloudOff,
+  Loader2,
+  WrapText,
+} from 'lucide-react';
 import { CodeEditor, type CodeEditorHandle } from './components/CodeEditor';
 import { ConsolePanel, type ConsolePanelHandle } from './components/ConsolePanel';
 import { OfflineIndicator } from './components/OfflineIndicator';
@@ -8,6 +16,12 @@ import { TopBar } from './components/TopBar';
 import { CODE_TEMPLATES, DEFAULT_CODE } from './data/templates';
 import { useOnlineStatus, useServiceWorkerStatus } from './hooks/usePWA';
 import { BrowserCppSession, compileInBrowser } from './runtime/cppEngine';
+import {
+  applyThemeToDocument,
+  getThemeById,
+  normalizeThemeId,
+  type ThemeId,
+} from './themes/themes';
 import type {
   CodeTemplate,
   CompilerDiagnostic,
@@ -17,6 +31,14 @@ import type {
   LayoutPreference,
   RunStatus,
 } from './types/compiler';
+import {
+  getAutosaveStatusText,
+  parseAutosaveEnabled,
+  parseSavedTimestamp,
+  safeReadStorage,
+  safeWriteStorage,
+  type AutosaveState,
+} from './utils/autosave';
 import { summarizeDiagnostics } from './utils/diagnostics';
 import { formatCppCode } from './utils/formatCpp';
 import {
@@ -26,7 +48,6 @@ import {
   resolveWordWrap,
   type WordWrapPreference,
 } from './utils/layout';
-import { getThemeColorHex } from './utils/pwa';
 
 const STORAGE_KEYS = {
   language: 'cppstudio.language',
@@ -38,58 +59,56 @@ const STORAGE_KEYS = {
   fontSize: 'cppstudio.fontSize',
   layout: 'cppstudio.layout',
   wordWrap: 'cppstudio.wordWrap',
+  splitRatio: 'cppstudio.splitRatio',
+  autosave: 'cppstudio.autosave',
+  lastSavedAt: 'cppstudio.lastSavedAt',
 };
-
-function readStorage(key: string, fallback: string): string {
-  try {
-    return localStorage.getItem(key) ?? fallback;
-  } catch {
-    return fallback;
-  }
-}
-
-function writeStorage(key: string, value: string): void {
-  try {
-    localStorage.setItem(key, value);
-  } catch {
-    // Ignore storage quota / private mode errors
-  }
-}
 
 export default function App() {
   const [language, setLanguage] = useState<Language>(() => {
-    const saved = readStorage(STORAGE_KEYS.language, 'cpp');
+    const saved = safeReadStorage(STORAGE_KEYS.language, 'cpp');
     return saved === 'c' ? 'c' : 'cpp';
   });
 
   const [standards, setStandards] = useState<Record<Language, CompilerStandard>>(() => ({
-    cpp: readStorage(STORAGE_KEYS.standardCpp, 'c++20') as CompilerStandard,
-    c: readStorage(STORAGE_KEYS.standardC, 'c17') as CompilerStandard,
+    cpp: safeReadStorage(STORAGE_KEYS.standardCpp, 'c++20') as CompilerStandard,
+    c: safeReadStorage(STORAGE_KEYS.standardC, 'c17') as CompilerStandard,
   }));
 
   const [codes, setCodes] = useState<Record<Language, string>>(() => ({
-    cpp: readStorage(STORAGE_KEYS.codeCpp, DEFAULT_CODE.cpp),
-    c: readStorage(STORAGE_KEYS.codeC, DEFAULT_CODE.c),
+    cpp: safeReadStorage(STORAGE_KEYS.codeCpp, DEFAULT_CODE.cpp),
+    c: safeReadStorage(STORAGE_KEYS.codeC, DEFAULT_CODE.c),
   }));
 
-  const [theme, setTheme] = useState<'dark' | 'light'>(() => {
-    const saved = readStorage(STORAGE_KEYS.theme, 'dark');
-    return saved === 'light' ? 'light' : 'dark';
-  });
+  const [themeId, setThemeId] = useState<ThemeId>(() =>
+    normalizeThemeId(safeReadStorage(STORAGE_KEYS.theme, 'github-dark'))
+  );
+
+  const [autosaveEnabled, setAutosaveEnabled] = useState<boolean>(() =>
+    parseAutosaveEnabled(safeReadStorage(STORAGE_KEYS.autosave, 'true'))
+  );
+
+  const [lastSavedAt, setLastSavedAt] = useState<number | null>(() =>
+    parseSavedTimestamp(safeReadStorage(STORAGE_KEYS.lastSavedAt, ''))
+  );
+
+  const [autosaveState, setAutosaveState] = useState<AutosaveState>(() =>
+    parseAutosaveEnabled(safeReadStorage(STORAGE_KEYS.autosave, 'true')) ? 'saved' : 'disabled'
+  );
 
   const [fontSize, setFontSize] = useState<number>(() => {
-    const parsed = Number.parseInt(readStorage(STORAGE_KEYS.fontSize, '14'), 10);
+    const parsed = Number.parseInt(safeReadStorage(STORAGE_KEYS.fontSize, '14'), 10);
     return Number.isFinite(parsed) && parsed >= 12 && parsed <= 22 ? parsed : 14;
   });
 
   const [layoutPreference, setLayoutPreference] = useState<LayoutPreference>(() => {
-    const saved = readStorage(STORAGE_KEYS.layout, 'auto');
+    const saved = safeReadStorage(STORAGE_KEYS.layout, 'auto');
     if (saved === 'side-by-side' || saved === 'stacked' || saved === 'tabs') return saved;
     return 'auto';
   });
 
   const [wordWrapPreference, setWordWrapPreference] = useState<WordWrapPreference>(() => {
-    const saved = readStorage(STORAGE_KEYS.wordWrap, 'auto');
+    const saved = safeReadStorage(STORAGE_KEYS.wordWrap, 'auto');
     if (saved === 'on' || saved === 'off') return saved;
     return 'auto';
   });
@@ -101,9 +120,13 @@ export default function App() {
 
   const [editorWidth, setEditorWidth] = useState<number | undefined>(undefined);
 
-  const [splitRatio, setSplitRatio] = useState<number>(() =>
-    getDefaultSplitRatio(typeof window !== 'undefined' ? window.innerWidth : 1440)
-  );
+  const [splitRatio, setSplitRatio] = useState<number>(() => {
+    const saved = Number.parseFloat(safeReadStorage(STORAGE_KEYS.splitRatio, ''));
+    if (Number.isFinite(saved)) {
+      return clampSplitRatio(saved);
+    }
+    return getDefaultSplitRatio(typeof window !== 'undefined' ? window.innerWidth : 1440);
+  });
   const [activeTab, setActiveTab] = useState<'editor' | 'console'>('editor');
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [formattedFeedback, setFormattedFeedback] = useState(false);
@@ -131,13 +154,18 @@ export default function App() {
 
   const codesRef = useRef(codes);
   codesRef.current = codes;
+  const autosaveEnabledRef = useRef(autosaveEnabled);
+  autosaveEnabledRef.current = autosaveEnabled;
   const sessionRef = useRef<BrowserCppSession | null>(null);
   const chunkCounterRef = useRef(0);
   const formatTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const autosaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const editorRef = useRef<CodeEditorHandle | null>(null);
   const consoleRef = useRef<ConsolePanelHandle | null>(null);
   const workspaceRef = useRef<HTMLDivElement | null>(null);
   const draggingRef = useRef(false);
+
+  const activeTheme = useMemo(() => getThemeById(themeId), [themeId]);
 
   const effectiveLayout = useMemo(
     () => resolveEffectiveLayout(layoutPreference, viewport.width, viewport.height),
@@ -152,11 +180,66 @@ export default function App() {
   const currentCode = codes[language];
   const currentStandard = standards[language];
   const diagSummary = useMemo(() => summarizeDiagnostics(diagnostics), [diagnostics]);
+  const autosaveStatus = useMemo(
+    () => getAutosaveStatusText(autosaveState, lastSavedAt),
+    [autosaveState, lastSavedAt]
+  );
 
   const getLiveCode = useCallback((): string => {
     const editorText = editorRef.current?.getValue();
     return editorText !== undefined ? editorText : codesRef.current[language];
   }, [language]);
+
+  const flushCodeToStorage = useCallback(
+    (targetCodes: Record<Language, string> = codesRef.current) => {
+      const now = Date.now();
+      const cppRes = safeWriteStorage(STORAGE_KEYS.codeCpp, targetCodes.cpp, undefined, now);
+      const cRes = safeWriteStorage(STORAGE_KEYS.codeC, targetCodes.c, undefined, now);
+      if (cppRes.ok && cRes.ok) {
+        safeWriteStorage(STORAGE_KEYS.lastSavedAt, String(now), undefined, now);
+        setLastSavedAt(now);
+        setAutosaveState('saved');
+      } else {
+        setAutosaveState('error');
+      }
+    },
+    []
+  );
+
+  const scheduleAutosave = useCallback(
+    (nextCodes: Record<Language, string>) => {
+      if (!autosaveEnabledRef.current) {
+        setAutosaveState('disabled');
+        return;
+      }
+      setAutosaveState('saving');
+      if (autosaveTimerRef.current) {
+        clearTimeout(autosaveTimerRef.current);
+      }
+      autosaveTimerRef.current = setTimeout(() => {
+        flushCodeToStorage(nextCodes);
+      }, 400);
+    },
+    [flushCodeToStorage]
+  );
+
+  const handleToggleAutosave = useCallback(() => {
+    setAutosaveEnabled((prev) => {
+      const next = !prev;
+      autosaveEnabledRef.current = next;
+      safeWriteStorage(STORAGE_KEYS.autosave, String(next));
+      if (next) {
+        const liveCode = getLiveCode();
+        const synced = { ...codesRef.current, [language]: liveCode };
+        codesRef.current = synced;
+        flushCodeToStorage(synced);
+      } else {
+        if (autosaveTimerRef.current) clearTimeout(autosaveTimerRef.current);
+        setAutosaveState('disabled');
+      }
+      return next;
+    });
+  }, [flushCodeToStorage, getLiveCode, language]);
 
   const appendChunk = useCallback((kind: ConsoleChunk['kind'], text: string) => {
     chunkCounterRef.current += 1;
@@ -164,45 +247,67 @@ export default function App() {
     setChunks((prev) => [...prev, { id, kind, text }]);
   }, []);
 
-  // Keep <html>.dark and PWA theme-color meta synced with theme state
+  // Apply selected IDE theme CSS variables, dark class, and PWA theme-color meta
   useEffect(() => {
-    document.documentElement.classList.toggle('dark', theme === 'dark');
-    const metaTheme = document.getElementById('theme-color-meta');
-    if (metaTheme) {
-      metaTheme.setAttribute('content', getThemeColorHex(theme));
-    }
-    writeStorage(STORAGE_KEYS.theme, theme);
-  }, [theme]);
+    applyThemeToDocument(activeTheme);
+    safeWriteStorage(STORAGE_KEYS.theme, themeId);
+  }, [activeTheme, themeId]);
 
-  // Persist editor code & settings
+  // Persist workspace preferences
   useEffect(() => {
-    writeStorage(STORAGE_KEYS.language, language);
+    safeWriteStorage(STORAGE_KEYS.language, language);
   }, [language]);
 
   useEffect(() => {
-    writeStorage(STORAGE_KEYS.standardCpp, standards.cpp);
-    writeStorage(STORAGE_KEYS.standardC, standards.c);
+    safeWriteStorage(STORAGE_KEYS.standardCpp, standards.cpp);
+    safeWriteStorage(STORAGE_KEYS.standardC, standards.c);
   }, [standards]);
 
   useEffect(() => {
-    writeStorage(STORAGE_KEYS.codeCpp, codes.cpp);
-  }, [codes.cpp]);
-
-  useEffect(() => {
-    writeStorage(STORAGE_KEYS.codeC, codes.c);
-  }, [codes.c]);
-
-  useEffect(() => {
-    writeStorage(STORAGE_KEYS.fontSize, String(fontSize));
+    safeWriteStorage(STORAGE_KEYS.fontSize, String(fontSize));
   }, [fontSize]);
 
   useEffect(() => {
-    writeStorage(STORAGE_KEYS.layout, layoutPreference);
+    safeWriteStorage(STORAGE_KEYS.layout, layoutPreference);
   }, [layoutPreference]);
 
   useEffect(() => {
-    writeStorage(STORAGE_KEYS.wordWrap, wordWrapPreference);
+    safeWriteStorage(STORAGE_KEYS.wordWrap, wordWrapPreference);
   }, [wordWrapPreference]);
+
+  useEffect(() => {
+    safeWriteStorage(STORAGE_KEYS.splitRatio, splitRatio.toFixed(4));
+  }, [splitRatio]);
+
+  // Immediately flush code when page is hidden/unloaded (vital for iPad Safari / PWA suspension)
+  useEffect(() => {
+    const flushIfEnabled = () => {
+      if (!autosaveEnabledRef.current) return;
+      const live = editorRef.current?.getValue();
+      const snapshot =
+        live !== undefined ? { ...codesRef.current, [language]: live } : codesRef.current;
+      codesRef.current = snapshot;
+      const now = Date.now();
+      safeWriteStorage(STORAGE_KEYS.codeCpp, snapshot.cpp, undefined, now);
+      safeWriteStorage(STORAGE_KEYS.codeC, snapshot.c, undefined, now);
+      safeWriteStorage(STORAGE_KEYS.lastSavedAt, String(now), undefined, now);
+    };
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        flushIfEnabled();
+      }
+    };
+
+    window.addEventListener('pagehide', flushIfEnabled);
+    window.addEventListener('beforeunload', flushIfEnabled);
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      window.removeEventListener('pagehide', flushIfEnabled);
+      window.removeEventListener('beforeunload', flushIfEnabled);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
+  }, [language]);
 
   // Track viewport resize (iPad Split View transitions & external Full HD monitor attach/detach)
   useEffect(() => {
@@ -234,9 +339,12 @@ export default function App() {
     // Synchronously read live editor buffer to eliminate stale-closure races on Cmd+Enter / Run
     const liveCode = getLiveCode();
     if (codesRef.current[language] !== liveCode) {
-      codesRef.current = { ...codesRef.current, [language]: liveCode };
-      setCodes((prev) => ({ ...prev, [language]: liveCode }));
-      writeStorage(language === 'cpp' ? STORAGE_KEYS.codeCpp : STORAGE_KEYS.codeC, liveCode);
+      const nextCodes = { ...codesRef.current, [language]: liveCode };
+      codesRef.current = nextCodes;
+      setCodes(nextCodes);
+      if (autosaveEnabledRef.current) {
+        flushCodeToStorage(nextCodes);
+      }
     }
 
     setRunId((id) => id + 1);
@@ -299,21 +407,25 @@ export default function App() {
       },
     });
     sessionRef.current = session;
-  }, [appendChunk, effectiveLayout, getLiveCode, language, stopActiveSession]);
+  }, [appendChunk, effectiveLayout, flushCodeToStorage, getLiveCode, language, stopActiveSession]);
 
   const handleFormatCode = useCallback(() => {
     const liveCode = getLiveCode();
     const formatted = formatCppCode(liveCode);
     if (formatted !== codesRef.current[language]) {
-      codesRef.current = { ...codesRef.current, [language]: formatted };
-      setCodes((prev) => ({ ...prev, [language]: formatted }));
+      const nextCodes = { ...codesRef.current, [language]: formatted };
+      codesRef.current = nextCodes;
+      setCodes(nextCodes);
+      if (autosaveEnabledRef.current) {
+        flushCodeToStorage(nextCodes);
+      }
     }
     setFormattedFeedback(true);
     if (formatTimerRef.current) clearTimeout(formatTimerRef.current);
     formatTimerRef.current = setTimeout(() => {
       setFormattedFeedback(false);
     }, 1500);
-  }, [getLiveCode, language]);
+  }, [flushCodeToStorage, getLiveCode, language]);
 
   const handleToggleWordWrap = useCallback(() => {
     setWordWrapPreference(effectiveWordWrap ? 'off' : 'on');
@@ -371,6 +483,11 @@ export default function App() {
   const handleDownloadCode = useCallback(() => {
     const filename = language === 'cpp' ? 'main.cpp' : 'main.c';
     const liveCode = getLiveCode();
+    if (autosaveEnabledRef.current) {
+      const nextCodes = { ...codesRef.current, [language]: liveCode };
+      codesRef.current = nextCodes;
+      flushCodeToStorage(nextCodes);
+    }
     const blob = new Blob([liveCode], { type: 'text/plain;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
@@ -380,24 +497,37 @@ export default function App() {
     link.click();
     link.remove();
     URL.revokeObjectURL(url);
-  }, [getLiveCode, language]);
+  }, [flushCodeToStorage, getLiveCode, language]);
 
   const handleImportCode = useCallback(
     (content: string, detectedLang?: Language) => {
+      stopActiveSession();
       const targetLang = detectedLang ?? language;
       if (detectedLang) {
         setLanguage(detectedLang);
       }
-      setCodes((prev) => ({ ...prev, [targetLang]: content }));
+      const nextCodes = { ...codesRef.current, [targetLang]: content };
+      codesRef.current = nextCodes;
+      setCodes(nextCodes);
+      if (autosaveEnabledRef.current) {
+        flushCodeToStorage(nextCodes);
+      }
       setDiagnostics([]);
+      setStatus('idle');
     },
-    [language]
+    [flushCodeToStorage, language, stopActiveSession]
   );
 
   const handleSelectTemplate = useCallback(
     (tpl: CodeTemplate) => {
+      stopActiveSession();
       setLanguage(tpl.language);
-      setCodes((prev) => ({ ...prev, [tpl.language]: tpl.code }));
+      const nextCodes = { ...codesRef.current, [tpl.language]: tpl.code };
+      codesRef.current = nextCodes;
+      setCodes(nextCodes);
+      if (autosaveEnabledRef.current) {
+        flushCodeToStorage(nextCodes);
+      }
       setDiagnostics([]);
       setChunks([]);
       setStatus('idle');
@@ -405,7 +535,7 @@ export default function App() {
         setActiveTab('editor');
       }
     },
-    [effectiveLayout]
+    [effectiveLayout, flushCodeToStorage, stopActiveSession]
   );
 
   const handleChangeFontSize = useCallback((delta: number) => {
@@ -492,6 +622,7 @@ export default function App() {
     return () => {
       stopActiveSession();
       if (formatTimerRef.current) clearTimeout(formatTimerRef.current);
+      if (autosaveTimerRef.current) clearTimeout(autosaveTimerRef.current);
     };
   }, [stopActiveSession]);
 
@@ -538,7 +669,7 @@ export default function App() {
 
   return (
     <div
-      className={`flex h-dvh w-full flex-col overflow-hidden bg-white text-[#111827] dark:bg-[#0D1117] dark:text-[#E6EDF3] ${
+      className={`flex h-dvh w-full flex-col overflow-hidden bg-[var(--app-bg)] text-[var(--app-text)] ${
         isDragging
           ? effectiveLayout === 'side-by-side'
             ? 'select-none cursor-col-resize'
@@ -550,21 +681,25 @@ export default function App() {
         language={language}
         standard={currentStandard}
         status={status}
-        theme={theme}
+        themeId={themeId}
         fontSize={fontSize}
         layoutPreference={layoutPreference}
         effectiveLayout={effectiveLayout}
         templates={CODE_TEMPLATES}
         onChangeLanguage={(lang) => {
+          stopActiveSession();
           setLanguage(lang);
           setDiagnostics([]);
+          if (status === 'running' || status === 'compiling') {
+            setStatus('idle');
+          }
         }}
         onChangeStandard={(std) => setStandards((prev) => ({ ...prev, [language]: std }))}
         onSelectTemplate={handleSelectTemplate}
         onRun={() => void handleRun()}
         onStop={() => void handleStop()}
         onFormat={handleFormatCode}
-        onToggleTheme={() => setTheme((prev) => (prev === 'dark' ? 'light' : 'dark'))}
+        onSelectTheme={(nextTheme) => setThemeId(nextTheme)}
         onChangeFontSize={handleChangeFontSize}
         onSelectLayout={(nextLayout) => setLayoutPreference(nextLayout)}
         onDownloadCode={handleDownloadCode}
@@ -579,7 +714,7 @@ export default function App() {
         <div
           role="tablist"
           aria-label="Переключение между редактором и консолью"
-          className="flex h-11 shrink-0 items-center border-b border-[#DFE4EC] bg-[#F3F5F8] px-3 dark:border-[#232B38] dark:bg-[#141922]"
+          className="flex h-11 shrink-0 items-center border-b border-[var(--app-border)] bg-[var(--app-surface)] px-3"
         >
           <button
             type="button"
@@ -588,8 +723,8 @@ export default function App() {
             onClick={() => setActiveTab('editor')}
             className={`flex h-full flex-1 items-center justify-center border-b-2 text-xs font-semibold transition-colors whitespace-nowrap ${
               activeTab === 'editor'
-                ? 'border-[#2563EB] text-[#111827] dark:text-[#E6EDF3]'
-                : 'border-transparent text-[#5B6576] hover:text-[#111827] dark:text-[#8B95A5] dark:hover:text-[#E6EDF3]'
+                ? 'border-[var(--app-accent)] text-[var(--app-text)]'
+                : 'border-transparent text-[var(--app-text-secondary)] hover:text-[var(--app-text)]'
             }`}
           >
             Код · {currentFileName}
@@ -601,8 +736,8 @@ export default function App() {
             onClick={() => setActiveTab('console')}
             className={`flex h-full flex-1 items-center justify-center border-b-2 text-xs font-semibold transition-colors whitespace-nowrap ${
               activeTab === 'console'
-                ? 'border-[#2563EB] text-[#111827] dark:text-[#E6EDF3]'
-                : 'border-transparent text-[#5B6576] hover:text-[#111827] dark:text-[#8B95A5] dark:hover:text-[#E6EDF3]'
+                ? 'border-[var(--app-accent)] text-[var(--app-text)]'
+                : 'border-transparent text-[var(--app-text-secondary)] hover:text-[var(--app-text)]'
             }`}
           >
             Консоль
@@ -642,21 +777,21 @@ export default function App() {
                 : { flex: '1 1 0%' }
           }
         >
-          {/* Editor sub-header: file info + Word Wrap toggle + Format (⌘⇧F) */}
-          <div className="flex h-10 shrink-0 items-center justify-between gap-2 border-b border-[#DFE4EC] bg-[#F3F5F8] px-3 sm:px-3.5 dark:border-[#232B38] dark:bg-[#141922]">
+          {/* Editor sub-header: file info + Autosave status toggle + Word Wrap + Format (⌘⇧F) */}
+          <div className="flex h-10 shrink-0 items-center justify-between gap-2 border-b border-[var(--app-border)] bg-[var(--app-surface)] px-3 sm:px-3.5">
             <div className="flex min-w-0 items-center gap-2 text-xs">
-              <span className="truncate font-mono font-semibold text-[#111827] dark:text-[#E6EDF3]">
+              <span className="truncate font-mono font-semibold text-[var(--app-text)]">
                 {currentFileName}
               </span>
-              <span aria-hidden="true" className="hidden min-[440px]:inline text-[#94A3B8] dark:text-[#4B5565]">
+              <span aria-hidden="true" className="hidden min-[520px]:inline text-[var(--app-text-muted)]">
                 ·
               </span>
-              <span className="hidden min-[440px]:inline truncate text-[#5B6576] dark:text-[#8B95A5]">
+              <span className="hidden min-[520px]:inline truncate text-[var(--app-text-secondary)]">
                 {language === 'cpp' ? 'C++' : 'C'} ({currentStandard})
               </span>
               {diagSummary.errors > 0 && (
                 <>
-                  <span aria-hidden="true" className="text-[#94A3B8] dark:text-[#4B5565]">
+                  <span aria-hidden="true" className="text-[var(--app-text-muted)]">
                     ·
                   </span>
                   <span className="font-medium text-rose-600 tabular-nums whitespace-nowrap dark:text-rose-400">
@@ -669,6 +804,34 @@ export default function App() {
             <div className="flex shrink-0 items-center gap-1">
               <button
                 type="button"
+                aria-pressed={autosaveEnabled}
+                onClick={handleToggleAutosave}
+                data-testid="autosave-toggle"
+                title={autosaveStatus.tooltip}
+                className={`inline-flex h-7 items-center gap-1.5 rounded-md px-2 text-xs font-medium transition-colors whitespace-nowrap ${
+                  autosaveState === 'error'
+                    ? 'text-rose-600 hover:bg-rose-500/10 dark:text-rose-400'
+                    : autosaveState === 'disabled'
+                      ? 'text-[var(--app-text-muted)] hover:bg-[var(--app-hover)] hover:text-[var(--app-text)]'
+                      : 'text-[var(--app-text-secondary)] hover:bg-[var(--app-hover)] hover:text-[var(--app-text)]'
+                }`}
+              >
+                {autosaveState === 'saving' ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin text-[var(--app-accent)]" />
+                ) : autosaveState === 'disabled' ? (
+                  <CloudOff className="h-3.5 w-3.5" />
+                ) : autosaveState === 'error' ? (
+                  <AlertCircle className="h-3.5 w-3.5" />
+                ) : (
+                  <CloudCheck className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />
+                )}
+                <span className="hidden min-[400px]:inline tabular-nums">
+                  {autosaveStatus.shortLabel}
+                </span>
+              </button>
+
+              <button
+                type="button"
                 aria-pressed={effectiveWordWrap}
                 onClick={handleToggleWordWrap}
                 title={
@@ -678,8 +841,8 @@ export default function App() {
                 }
                 className={`inline-flex h-7 items-center gap-1.5 rounded-md px-2 text-xs font-medium transition-colors whitespace-nowrap ${
                   effectiveWordWrap
-                    ? 'bg-blue-500/12 text-blue-700 dark:bg-blue-500/20 dark:text-blue-300'
-                    : 'text-[#475569] hover:bg-black/5 hover:text-[#111827] dark:text-[#9CA3AF] dark:hover:bg-white/5 dark:hover:text-[#E6EDF3]'
+                    ? 'bg-[var(--app-accent-soft)] text-[var(--app-text)]'
+                    : 'text-[var(--app-text-secondary)] hover:bg-[var(--app-hover)] hover:text-[var(--app-text)]'
                 }`}
               >
                 <WrapText className="h-3.5 w-3.5" />
@@ -691,7 +854,7 @@ export default function App() {
                 onClick={handleFormatCode}
                 aria-label="Форматировать код"
                 title="Форматировать код (⌘⇧F)"
-                className="inline-flex h-7 items-center gap-1.5 rounded-md px-2 text-xs font-medium text-[#475569] transition-colors hover:bg-black/5 hover:text-[#111827] whitespace-nowrap dark:text-[#9CA3AF] dark:hover:bg-white/5 dark:hover:text-[#E6EDF3]"
+                className="inline-flex h-7 items-center gap-1.5 rounded-md px-2 text-xs font-medium text-[var(--app-text-secondary)] transition-colors hover:bg-[var(--app-hover)] hover:text-[var(--app-text)] whitespace-nowrap"
               >
                 {formattedFeedback ? (
                   <Check className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />
@@ -699,7 +862,7 @@ export default function App() {
                   <AlignLeft className="h-3.5 w-3.5" />
                 )}
                 <span>{formattedFeedback ? 'Готово' : 'Формат'}</span>
-                <span className="hidden xl:inline font-mono text-[10px] text-[#64748B] dark:text-[#6E7A8A]">
+                <span className="hidden xl:inline font-mono text-[10px] text-[var(--app-text-muted)]">
                   ⌘⇧F
                 </span>
               </button>
@@ -711,10 +874,12 @@ export default function App() {
               ref={editorRef}
               value={currentCode}
               onChange={(next) => {
-                codesRef.current = { ...codesRef.current, [language]: next };
-                setCodes((prev) => ({ ...prev, [language]: next }));
+                const nextCodes = { ...codesRef.current, [language]: next };
+                codesRef.current = nextCodes;
+                setCodes(nextCodes);
+                scheduleAutosave(nextCodes);
               }}
-              theme={theme}
+              theme={activeTheme}
               fontSize={fontSize}
               lineWrapping={effectiveWordWrap}
               diagnostics={diagnostics}
@@ -739,8 +904,8 @@ export default function App() {
             onDoubleClick={() => setSplitRatio(0.5)}
             className={`group relative z-10 flex shrink-0 touch-none select-none items-center justify-center transition-colors ${
               isDragging
-                ? 'bg-[#2563EB] dark:bg-[#3B82F6]'
-                : 'bg-[#DFE4EC] hover:bg-[#2563EB] dark:bg-[#232B38] dark:hover:bg-[#3B82F6]'
+                ? 'bg-[var(--app-accent)]'
+                : 'bg-[var(--app-border)] hover:bg-[var(--app-accent)]'
             } ${
               effectiveLayout === 'side-by-side'
                 ? 'w-1.5 cursor-col-resize'
@@ -753,7 +918,7 @@ export default function App() {
               className={`rounded-full transition-colors ${
                 isDragging
                   ? 'bg-white/90'
-                  : 'bg-[#94A3B8]/60 group-hover:bg-white/90 dark:bg-[#64748B]/70'
+                  : 'bg-[var(--app-text-muted)]/60 group-hover:bg-white/90'
               } ${effectiveLayout === 'side-by-side' ? 'h-8 w-0.5' : 'h-0.5 w-8'}`}
             />
             {/* Expanded invisible hit target for effortless iPad touch & stylus grabbing */}

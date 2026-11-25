@@ -71,6 +71,13 @@ export const ConsolePanel = forwardRef<ConsolePanelHandle, ConsolePanelProps>(fu
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
+  const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
+    };
+  }, []);
 
   const summary = useMemo(() => summarizeDiagnostics(diagnostics), [diagnostics]);
 
@@ -145,7 +152,8 @@ export const ConsolePanel = forwardRef<ConsolePanelHandle, ConsolePanelProps>(fu
     try {
       await navigator.clipboard.writeText(text);
       setCopied(true);
-      setTimeout(() => setCopied(false), 1600);
+      if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
+      copyTimerRef.current = setTimeout(() => setCopied(false), 1600);
     } catch {
       // Clipboard unavailable in restricted context
     }
@@ -176,15 +184,15 @@ export const ConsolePanel = forwardRef<ConsolePanelHandle, ConsolePanelProps>(fu
     <section
       aria-label="Консоль вывода и отчёт об ошибках"
       data-testid="console-panel"
-      className="flex h-full w-full flex-col bg-[#FAFBFD] dark:bg-[#0D1117]"
+      className="flex h-full w-full flex-col bg-[var(--app-console)]"
     >
       {/* Console pane header */}
-      <div className="flex h-10 shrink-0 items-center justify-between gap-3 border-b border-[#DFE4EC] bg-[#F3F5F8] px-3.5 dark:border-[#232B38] dark:bg-[#141922]">
+      <div className="flex h-10 shrink-0 items-center justify-between gap-3 border-b border-[var(--app-border)] bg-[var(--app-surface)] px-3.5">
         <div className="flex min-w-0 items-center gap-2.5">
-          <span className="text-xs font-semibold text-[#111827] whitespace-nowrap dark:text-[#E6EDF3]">
+          <span className="text-xs font-semibold text-[var(--app-text)] whitespace-nowrap">
             Консоль
           </span>
-          <span aria-hidden="true" className="text-[#94A3B8] dark:text-[#4B5565]">
+          <span aria-hidden="true" className="text-[var(--app-text-muted)]">
             ·
           </span>
           <span
@@ -196,7 +204,7 @@ export const ConsolePanel = forwardRef<ConsolePanelHandle, ConsolePanelProps>(fu
                   ? 'font-medium text-blue-600 dark:text-blue-400'
                   : status === 'completed' && exitCode === 0
                     ? 'text-emerald-700 dark:text-emerald-400'
-                    : 'text-[#5B6576] dark:text-[#8B95A5]'
+                    : 'text-[var(--app-text-secondary)]'
             }`}
           >
             {statusText}
@@ -209,7 +217,7 @@ export const ConsolePanel = forwardRef<ConsolePanelHandle, ConsolePanelProps>(fu
               type="button"
               onClick={onSendEof}
               title="Отправить конец ввода (Ctrl+D)"
-              className="inline-flex h-7 items-center rounded-md px-2 text-xs font-medium text-[#475569] transition-colors hover:bg-black/5 hover:text-[#111827] whitespace-nowrap dark:text-[#9CA3AF] dark:hover:bg-white/5 dark:hover:text-[#E6EDF3]"
+              className="inline-flex h-7 items-center rounded-md px-2 text-xs font-medium text-[var(--app-text-secondary)] transition-colors hover:bg-[var(--app-hover)] hover:text-[var(--app-text)] whitespace-nowrap"
             >
               EOF
             </button>
@@ -221,7 +229,7 @@ export const ConsolePanel = forwardRef<ConsolePanelHandle, ConsolePanelProps>(fu
             disabled={!hasCopyableContent}
             aria-label="Копировать вывод консоли"
             title="Копировать вывод"
-            className="inline-flex h-7 items-center gap-1.5 rounded-md px-2 text-xs font-medium text-[#475569] transition-colors hover:bg-black/5 hover:text-[#111827] disabled:cursor-not-allowed disabled:opacity-40 whitespace-nowrap dark:text-[#9CA3AF] dark:hover:bg-white/5 dark:hover:text-[#E6EDF3]"
+            className="inline-flex h-7 items-center gap-1.5 rounded-md px-2 text-xs font-medium text-[var(--app-text-secondary)] transition-colors hover:bg-[var(--app-hover)] hover:text-[var(--app-text)] disabled:cursor-not-allowed disabled:opacity-40 whitespace-nowrap"
           >
             {copied ? (
               <Check className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />
@@ -236,7 +244,7 @@ export const ConsolePanel = forwardRef<ConsolePanelHandle, ConsolePanelProps>(fu
             onClick={onClear}
             aria-label="Очистить консоль"
             title="Очистить консоль (⌘K)"
-            className="inline-flex h-7 items-center gap-1.5 rounded-md px-2 text-xs font-medium text-[#475569] transition-colors hover:bg-black/5 hover:text-[#111827] whitespace-nowrap dark:text-[#9CA3AF] dark:hover:bg-white/5 dark:hover:text-[#E6EDF3]"
+            className="inline-flex h-7 items-center gap-1.5 rounded-md px-2 text-xs font-medium text-[var(--app-text-secondary)] transition-colors hover:bg-[var(--app-hover)] hover:text-[var(--app-text)] whitespace-nowrap"
           >
             <Trash2 className="h-3.5 w-3.5" />
             <span className="hidden sm:inline">Очистить</span>
@@ -437,15 +445,15 @@ export const ConsolePanel = forwardRef<ConsolePanelHandle, ConsolePanelProps>(fu
         )}
 
         {status === 'idle' && chunks.length === 0 && (
-          <div className="flex h-full flex-col items-start justify-start pt-2 text-[#5B6576] dark:text-[#8B95A5]">
+          <div className="flex h-full flex-col items-start justify-start pt-2 text-[var(--app-text-secondary)]">
             <p className="text-sm leading-relaxed">
-              Нажмите <strong className="font-semibold text-[#111827] dark:text-[#E6EDF3]">Запустить</strong> или{' '}
-              <kbd className="rounded border border-[#DFE4EC] bg-[#F3F5F8] px-1.5 py-0.5 font-mono text-xs text-[#111827] dark:border-[#2C3545] dark:bg-[#161D28] dark:text-[#E6EDF3]">
+              Нажмите <strong className="font-semibold text-[var(--app-text)]">Запустить</strong> или{' '}
+              <kbd className="rounded border border-[var(--app-border)] bg-[var(--app-surface)] px-1.5 py-0.5 font-mono text-xs text-[var(--app-text)]">
                 ⌘↵
               </kbd>{' '}
               на Magic Keyboard, чтобы скомпилировать и запустить программу.
             </p>
-            <p className="mt-2 text-xs leading-relaxed text-[#64748B] dark:text-[#6E7A8A]">
+            <p className="mt-2 text-xs leading-relaxed text-[var(--app-text-muted)]">
               Во время выполнения числа и строки вводятся прямо здесь — так же, как в консоли Programiz.
             </p>
           </div>
@@ -454,7 +462,7 @@ export const ConsolePanel = forwardRef<ConsolePanelHandle, ConsolePanelProps>(fu
         {status !== 'compile_error' && (chunks.length > 0 || status === 'running') && (
           <div
             data-testid="console-transcript"
-            className="font-mono whitespace-pre-wrap break-words text-[#111827] dark:text-[#E6EDF3]"
+            className="font-mono whitespace-pre-wrap break-words text-[var(--app-text)]"
           >
             {chunks.map((chunk) => {
               if (chunk.kind === 'stdin') {
@@ -516,14 +524,14 @@ export const ConsolePanel = forwardRef<ConsolePanelHandle, ConsolePanelProps>(fu
 
       {/* Subtle interactive input helper bar ONLY while program is actively running */}
       {status === 'running' && (
-        <div className="flex shrink-0 items-center justify-between gap-3 border-t border-[#DFE4EC] bg-[#F3F5F8] px-3.5 py-2 dark:border-[#232B38] dark:bg-[#141922]">
-          <span className="truncate text-xs text-[#5B6576] dark:text-[#8B95A5]">
+        <div className="flex shrink-0 items-center justify-between gap-3 border-t border-[var(--app-border)] bg-[var(--app-surface)] px-3.5 py-2">
+          <span className="truncate text-xs text-[var(--app-text-secondary)]">
             Печатайте прямо в консоли и нажмите Enter для отправки ввода
           </span>
           <button
             type="button"
             onClick={handleSubmitLine}
-            className="inline-flex h-7 shrink-0 items-center gap-1.5 rounded-md border border-[#CFD7E3] bg-white px-2.5 text-xs font-medium text-[#111827] transition-colors hover:bg-[#F8FAFC] whitespace-nowrap dark:border-[#2D3748] dark:bg-[#1C2330] dark:text-[#E6EDF3] dark:hover:bg-[#242D3D]"
+            className="inline-flex h-7 shrink-0 items-center gap-1.5 rounded-md border border-[var(--app-border-strong)] bg-[var(--app-elevated)] px-2.5 text-xs font-medium text-[var(--app-text)] transition-colors hover:bg-[var(--app-hover)] whitespace-nowrap"
           >
             <CornerDownLeft className="h-3.5 w-3.5" />
             <span>Отправить</span>

@@ -72,12 +72,12 @@ export function PWAInstallButton({
           type="button"
           role="menuitem"
           onClick={() => void handleClick()}
-          className={`${className || 'flex'} w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-xs font-medium text-[#111827] hover:bg-[#F3F5F8] dark:text-[#E6EDF3] dark:hover:bg-[#202938]`}
+          className={`${className || 'flex'} w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-xs font-medium text-[var(--app-text)] hover:bg-[var(--app-hover)]`}
         >
           {isIOS ? (
-            <Smartphone className="h-3.5 w-3.5 text-[#5B6576] dark:text-[#8B95A5]" />
+            <Smartphone className="h-3.5 w-3.5 text-[var(--app-text-secondary)]" />
           ) : (
-            <Download className="h-3.5 w-3.5 text-[#5B6576] dark:text-[#8B95A5]" />
+            <Download className="h-3.5 w-3.5 text-[var(--app-text-secondary)]" />
           )}
           <span>
             {actionMode === 'native-prompt'
@@ -93,8 +93,8 @@ export function PWAInstallButton({
           title={buttonAriaLabel}
           className={`${className || 'inline-flex'} h-8 items-center gap-1.5 rounded-lg border px-2 sm:px-2.5 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
             actionMode === 'native-prompt'
-              ? 'border-blue-500/35 bg-blue-500/10 text-blue-700 hover:bg-blue-500/15 dark:border-blue-400/35 dark:bg-blue-500/15 dark:text-blue-300 dark:hover:bg-blue-500/25'
-              : 'border-[#D8DEE8] bg-white text-[#475569] hover:bg-[#F8FAFC] hover:text-[#111827] dark:border-[#252E3D] dark:bg-[#181F2B] dark:text-[#9CA3AF] dark:hover:bg-[#1F2836] dark:hover:text-[#E6EDF3]'
+              ? 'border-[var(--app-accent)] bg-[var(--app-accent-soft)] text-[var(--app-text)]'
+              : 'border-[var(--app-border-strong)] bg-[var(--app-elevated)] text-[var(--app-text-secondary)] hover:bg-[var(--app-hover)] hover:text-[var(--app-text)]'
           }`}
         >
           {isIOS ? (
@@ -116,17 +116,17 @@ export function PWAInstallButton({
             aria-modal="true"
             aria-labelledby="pwa-install-title"
             onClick={(e) => e.stopPropagation()}
-            className="w-full max-w-md rounded-2xl border border-[#DFE4EC] bg-white p-5 shadow-2xl dark:border-[#283244] dark:bg-[#141922]"
+            className="w-full max-w-md rounded-2xl border border-[var(--app-border)] bg-[var(--app-surface)] p-5 shadow-2xl"
           >
             <div className="flex items-start justify-between gap-3">
               <div>
                 <h2
                   id="pwa-install-title"
-                  className="text-base font-semibold text-[#111827] dark:text-[#E6EDF3]"
+                  className="text-base font-semibold text-[var(--app-text)]"
                 >
                   Работа без интернета и установка
                 </h2>
-                <p className="mt-1 text-xs text-[#5B6576] dark:text-[#8B95A5]">
+                <p className="mt-1 text-xs text-[var(--app-text-secondary)]">
                   Компилятор C++ и C работает полностью локально прямо в браузере.
                 </p>
               </div>
@@ -134,13 +134,13 @@ export function PWAInstallButton({
                 type="button"
                 onClick={closeGuide}
                 aria-label="Закрыть окно установки"
-                className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-[#5B6576] transition-colors hover:bg-[#F3F5F8] hover:text-[#111827] dark:text-[#8B95A5] dark:hover:bg-[#202938] dark:hover:text-[#E6EDF3]"
+                className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-[var(--app-text-secondary)] transition-colors hover:bg-[var(--app-hover)] hover:text-[var(--app-text)]"
               >
                 <X className="h-4 w-4" />
               </button>
             </div>
 
-            <div className="mt-4 flex items-center gap-2.5 rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] px-3 py-2.5 text-xs dark:border-[#232B38] dark:bg-[#0D1117]">
+            <div className="mt-4 flex items-center gap-2.5 rounded-xl border border-[var(--app-border)] bg-[var(--app-bg)] px-3 py-2.5 text-xs">
               <CheckCircle2
                 className={`h-4 w-4 shrink-0 ${
                   offlineReady
@@ -148,7 +148,7 @@ export function PWAInstallButton({
                     : 'text-blue-600 dark:text-blue-400'
                 }`}
               />
-              <span className="text-[#1E293B] dark:text-[#CBD5E1]">
+              <span className="text-[var(--app-text)]">
                 {!isOnline
                   ? 'Сейчас активен офлайн-режим — приложение работает из локального кэша.'
                   : offlineReady
@@ -157,18 +157,18 @@ export function PWAInstallButton({
               </span>
             </div>
 
-            <div className="mt-4 space-y-3 text-xs leading-relaxed text-[#334155] dark:text-[#CBD5E1]">
-              <div className="rounded-xl border border-[#E2E8F0] p-3 dark:border-[#232B38]">
-                <div className="flex items-center gap-1.5 font-semibold text-[#111827] dark:text-[#E6EDF3]">
-                  <Share className="h-3.5 w-3.5 text-[#2563EB] dark:text-blue-400" />
+            <div className="mt-4 space-y-3 text-xs leading-relaxed text-[var(--app-text-secondary)]">
+              <div className="rounded-xl border border-[var(--app-border)] bg-[var(--app-bg)]/50 p-3">
+                <div className="flex items-center gap-1.5 font-semibold text-[var(--app-text)]">
+                  <Share className="h-3.5 w-3.5 text-[var(--app-accent)]" />
                   <span>На iPad и iPhone (Safari)</span>
                 </div>
-                <ol className="mt-2 list-decimal space-y-1 pl-4 text-[#475569] dark:text-[#94A3B8]">
+                <ol className="mt-2 list-decimal space-y-1 pl-4">
                   <li>
-                    Нажмите кнопку <strong className="text-[#111827] dark:text-[#E6EDF3]">«Поделиться»</strong> в панели Safari.
+                    Нажмите кнопку <strong className="text-[var(--app-text)]">«Поделиться»</strong> в панели Safari.
                   </li>
                   <li>
-                    Выберите пункт <strong className="text-[#111827] dark:text-[#E6EDF3]">«На экран „Домой“»</strong> и нажмите <strong className="text-[#111827] dark:text-[#E6EDF3]">«Добавить»</strong>.
+                    Выберите пункт <strong className="text-[var(--app-text)]">«На экран „Домой“»</strong> и нажмите <strong className="text-[var(--app-text)]">«Добавить»</strong>.
                   </li>
                   <li>
                     Открывайте C++ Studio с рабочего стола даже в авиарежиме.
@@ -177,14 +177,14 @@ export function PWAInstallButton({
               </div>
 
               {!isIOS && (
-                <div className="rounded-xl border border-[#E2E8F0] p-3 dark:border-[#232B38]">
-                  <div className="flex items-center gap-1.5 font-semibold text-[#111827] dark:text-[#E6EDF3]">
-                    <Download className="h-3.5 w-3.5 text-[#2563EB] dark:text-blue-400" />
+                <div className="rounded-xl border border-[var(--app-border)] bg-[var(--app-bg)]/50 p-3">
+                  <div className="flex items-center gap-1.5 font-semibold text-[var(--app-text)]">
+                    <Download className="h-3.5 w-3.5 text-[var(--app-accent)]" />
                     <span>На компьютере и Android (Chrome / Edge)</span>
                   </div>
-                  <p className="mt-1.5 text-[#475569] dark:text-[#94A3B8]">
+                  <p className="mt-1.5">
                     Нажмите значок установки в адресной строке браузера или пункт{' '}
-                    <strong className="text-[#111827] dark:text-[#E6EDF3]">«Установить приложение»</strong> в меню браузера.
+                    <strong className="text-[var(--app-text)]">«Установить приложение»</strong> в меню браузера.
                   </p>
                 </div>
               )}
@@ -192,11 +192,8 @@ export function PWAInstallButton({
 
             <button
               type="button"
-              onClick={() => {
-                setGuideOpen(false);
-                onActionComplete?.();
-              }}
-              className="mt-4 w-full rounded-xl bg-[#2563EB] py-2 text-xs font-semibold text-white transition-colors hover:bg-[#1D4ED8]"
+              onClick={closeGuide}
+              className="mt-4 w-full rounded-xl bg-[var(--app-accent)] py-2 text-xs font-semibold text-white transition-colors hover:bg-[var(--app-accent-hover)]"
             >
               Понятно
             </button>

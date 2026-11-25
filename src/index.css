@@ -5,6 +5,20 @@
   :root {
     --font-sans: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    --app-bg: #0D1117;
+    --app-surface: #141922;
+    --app-elevated: #181F2B;
+    --app-console: #0D1117;
+    --app-inset: #0D1117;
+    --app-hover: #202938;
+    --app-border: #232B38;
+    --app-border-strong: #2D3748;
+    --app-text: #E6EDF3;
+    --app-text-secondary: #8B95A5;
+    --app-text-muted: #6E7A8A;
+    --app-accent: #2563EB;
+    --app-accent-hover: #1D4ED8;
+    --app-accent-soft: rgba(59, 130, 246, 0.16);
   }
 
   html,
@@ -18,6 +32,8 @@
     overflow: hidden;
     font-family: var(--font-sans);
     overscroll-behavior: none;
+    background-color: var(--app-bg);
+    color: var(--app-text);
   }
 
   code,

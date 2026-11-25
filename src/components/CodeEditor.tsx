@@ -23,6 +23,7 @@ import { highlightSelectionMatches, searchKeymap } from '@codemirror/search';
 import { cpp } from '@codemirror/lang-cpp';
 import { tags } from '@lezer/highlight';
 import type { CompilerDiagnostic } from '../types/compiler';
+import type { AppTheme } from '../themes/themes';
 
 export interface CodeEditorHandle {
   focus: () => void;
@@ -33,7 +34,7 @@ export interface CodeEditorHandle {
 interface CodeEditorProps {
   value: string;
   onChange: (next: string) => void;
-  theme: 'dark' | 'light';
+  theme: AppTheme;
   fontSize: number;
   lineWrapping: boolean;
   diagnostics: CompilerDiagnostic[];
@@ -44,7 +45,7 @@ interface CodeEditorProps {
 
 const setDiagnosticsEffect = StateEffect.define<{
   diagnostics: CompilerDiagnostic[];
-  theme: 'dark' | 'light';
+  mode: 'dark' | 'light';
 }>();
 
 const diagnosticLinesField = StateField.define<DecorationSet>({
@@ -55,7 +56,7 @@ const diagnosticLinesField = StateField.define<DecorationSet>({
     let next = decorations.map(tr.changes);
     for (const effect of tr.effects) {
       if (effect.is(setDiagnosticsEffect)) {
-        const { diagnostics, theme } = effect.value;
+        const { diagnostics, mode } = effect.value;
         const lineSeverity = new Map<number, 'error' | 'warning'>();
         for (const d of diagnostics) {
           if (d.line === null || d.line < 1 || d.line > tr.state.doc.lines) continue;
@@ -72,10 +73,10 @@ const diagnosticLinesField = StateField.define<DecorationSet>({
           const line = tr.state.doc.line(lineNum);
           const className =
             severity === 'error'
-              ? theme === 'dark'
+              ? mode === 'dark'
                 ? 'cm-error-line-dark'
                 : 'cm-error-line-light'
-              : theme === 'dark'
+              : mode === 'dark'
                 ? 'cm-warning-line-dark'
                 : 'cm-warning-line-light';
           builder.add(line.from, line.from, Decoration.line({ class: className }));
@@ -88,44 +89,36 @@ const diagnosticLinesField = StateField.define<DecorationSet>({
   provide: (field) => EditorView.decorations.from(field),
 });
 
-const darkHighlight = HighlightStyle.define([
-  { tag: [tags.keyword, tags.controlKeyword, tags.modifier], color: '#FF7B72' },
-  { tag: [tags.typeName, tags.className, tags.namespace], color: '#FFA657' },
-  { tag: [tags.function(tags.variableName), tags.function(tags.propertyName)], color: '#D2A8FF' },
-  { tag: [tags.string, tags.special(tags.string)], color: '#A5D6FF' },
-  { tag: [tags.number, tags.bool, tags.atom], color: '#79C0FF' },
-  { tag: [tags.comment, tags.lineComment, tags.blockComment], color: '#7D8590', fontStyle: 'italic' },
-  { tag: [tags.meta, tags.processingInstruction], color: '#79C0FF' },
-  { tag: [tags.operator, tags.punctuation], color: '#C9D1D9' },
-  { tag: [tags.variableName, tags.propertyName], color: '#E6EDF3' },
-]);
+function createSyntaxHighlight(theme: AppTheme) {
+  const s = theme.syntax;
+  return HighlightStyle.define([
+    { tag: [tags.keyword, tags.controlKeyword, tags.modifier], color: s.keyword },
+    { tag: [tags.typeName, tags.className, tags.namespace], color: s.type },
+    { tag: [tags.function(tags.variableName), tags.function(tags.propertyName)], color: s.fn },
+    { tag: [tags.string, tags.special(tags.string)], color: s.string },
+    { tag: [tags.number, tags.bool, tags.atom], color: s.number },
+    { tag: [tags.comment, tags.lineComment, tags.blockComment], color: s.comment, fontStyle: 'italic' },
+    { tag: [tags.meta, tags.processingInstruction], color: s.meta },
+    { tag: [tags.operator, tags.punctuation], color: s.operator },
+    { tag: [tags.variableName, tags.propertyName], color: s.variable },
+  ]);
+}
 
-const lightHighlight = HighlightStyle.define([
-  { tag: [tags.keyword, tags.controlKeyword, tags.modifier], color: '#CF222E' },
-  { tag: [tags.typeName, tags.className, tags.namespace], color: '#953800' },
-  { tag: [tags.function(tags.variableName), tags.function(tags.propertyName)], color: '#8250DF' },
-  { tag: [tags.string, tags.special(tags.string)], color: '#0A3069' },
-  { tag: [tags.number, tags.bool, tags.atom], color: '#0550AE' },
-  { tag: [tags.comment, tags.lineComment, tags.blockComment], color: '#6E7781', fontStyle: 'italic' },
-  { tag: [tags.meta, tags.processingInstruction], color: '#0550AE' },
-  { tag: [tags.operator, tags.punctuation], color: '#24292F' },
-  { tag: [tags.variableName, tags.propertyName], color: '#1F2328' },
-]);
-
-function createEditorTheme(theme: 'dark' | 'light', fontSize: number) {
-  const isDark = theme === 'dark';
+function createEditorTheme(theme: AppTheme, fontSize: number) {
+  const isDark = theme.mode === 'dark';
+  const { ui, syntax } = theme;
   return EditorView.theme(
     {
       '&': {
-        backgroundColor: isDark ? '#0D1117' : '#FFFFFF',
-        color: isDark ? '#E6EDF3' : '#111827',
+        backgroundColor: ui.bgApp,
+        color: ui.textPrimary,
         fontSize: `${fontSize}px`,
         lineHeight: '1.6',
       },
       '.cm-gutters': {
-        backgroundColor: isDark ? '#0D1117' : '#FFFFFF',
-        color: isDark ? '#4B5565' : '#94A3B8',
-        borderRight: `1px solid ${isDark ? '#1E2530' : '#E5E7EB'}`,
+        backgroundColor: syntax.gutterBg,
+        color: syntax.gutterText,
+        borderRight: `1px solid ${syntax.gutterBorder}`,
         minWidth: '38px',
       },
       '.cm-lineNumbers .cm-gutterElement': {
@@ -133,30 +126,30 @@ function createEditorTheme(theme: 'dark' | 'light', fontSize: number) {
         minWidth: '30px',
       },
       '.cm-activeLine': {
-        backgroundColor: isDark ? 'rgba(56, 139, 253, 0.07)' : 'rgba(37, 99, 235, 0.05)',
+        backgroundColor: syntax.activeLine,
       },
       '.cm-activeLineGutter': {
-        backgroundColor: isDark ? 'rgba(56, 139, 253, 0.09)' : 'rgba(37, 99, 235, 0.06)',
-        color: isDark ? '#C9D1D9' : '#334155',
+        backgroundColor: syntax.activeGutter,
+        color: syntax.activeGutterText,
       },
       '.cm-cursor, .cm-dropCursor': {
-        borderLeftColor: isDark ? '#60A5FA' : '#2563EB',
+        borderLeftColor: syntax.cursor,
         borderLeftWidth: '2px',
       },
       '&.cm-focused .cm-selectionBackground, .cm-selectionBackground, .cm-content ::selection': {
-        backgroundColor: isDark ? 'rgba(59, 130, 246, 0.28)' : 'rgba(37, 99, 235, 0.18)',
+        backgroundColor: syntax.selection,
       },
       '.cm-matchingBracket': {
-        backgroundColor: isDark ? 'rgba(59, 130, 246, 0.24)' : 'rgba(37, 99, 235, 0.16)',
-        outline: `1px solid ${isDark ? 'rgba(96, 165, 250, 0.5)' : 'rgba(37, 99, 235, 0.4)'}`,
+        backgroundColor: syntax.bracketBg,
+        outline: `1px solid ${syntax.bracketOutline}`,
       },
       '.cm-panels': {
-        backgroundColor: isDark ? '#141922' : '#F3F5F8',
-        color: isDark ? '#E6EDF3' : '#111827',
-        borderBottom: `1px solid ${isDark ? '#232B38' : '#DFE4EC'}`,
+        backgroundColor: ui.bgSurface,
+        color: ui.textPrimary,
+        borderBottom: `1px solid ${ui.border}`,
       },
       '.cm-searchMatch': {
-        backgroundColor: isDark ? 'rgba(245, 158, 11, 0.28)' : 'rgba(245, 158, 11, 0.3)',
+        backgroundColor: syntax.searchMatch,
       },
     },
     { dark: isDark }
@@ -237,7 +230,7 @@ export const CodeEditor = forwardRef<CodeEditorHandle, CodeEditorProps>(function
         }),
         themeCompartment.of([
           createEditorTheme(theme, fontSize),
-          syntaxHighlighting(theme === 'dark' ? darkHighlight : lightHighlight),
+          syntaxHighlighting(createSyntaxHighlight(theme)),
         ]),
         wrapCompartment.of(lineWrapping ? EditorView.lineWrapping : []),
         keymap.of([
@@ -313,7 +306,7 @@ export const CodeEditor = forwardRef<CodeEditorHandle, CodeEditorProps>(function
     view.dispatch({
       effects: themeCompartmentRef.current.reconfigure([
         createEditorTheme(theme, fontSize),
-        syntaxHighlighting(theme === 'dark' ? darkHighlight : lightHighlight),
+        syntaxHighlighting(createSyntaxHighlight(theme)),
       ]),
     });
     view.requestMeasure();
@@ -336,16 +329,16 @@ export const CodeEditor = forwardRef<CodeEditorHandle, CodeEditorProps>(function
     const view = viewRef.current;
     if (!view) return;
     view.dispatch({
-      effects: setDiagnosticsEffect.of({ diagnostics, theme }),
+      effects: setDiagnosticsEffect.of({ diagnostics, mode: theme.mode }),
     });
-  }, [diagnostics, theme]);
+  }, [diagnostics, theme.mode]);
 
   return (
     <div
       ref={containerRef}
       data-testid="code-editor"
       data-wrap={lineWrapping ? 'on' : 'off'}
-      className="h-full w-full min-w-0 max-w-full box-border overflow-hidden bg-white dark:bg-[#0D1117]"
+      className="h-full w-full min-w-0 max-w-full box-border overflow-hidden bg-[var(--app-bg)]"
     />
   );
 });

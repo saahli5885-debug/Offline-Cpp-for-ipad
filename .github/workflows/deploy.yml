@@ -10,9 +10,13 @@ permissions:
   pages: write
   id-token: write
 
+# Do not cancel in-progress Pages deployments to avoid partial/500 deployment conflicts
 concurrency:
   group: 'pages'
-  cancel-in-progress: true
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build:
@@ -24,13 +28,19 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v5
         with:
-          node-version: '22'
+          node-version: '24'
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
 
       - name: Install dependencies
         run: npm install
 
       - name: Build static site
         run: npm run build
+
+      - name: Remove temporary non-app media from dist
+        run: rm -rf ./dist/assets/aistudio
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
