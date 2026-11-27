@@ -7,6 +7,44 @@ export interface VirtualFile {
   isBinary?: boolean;
 }
 
+export interface VirtualFolder {
+  path: string;
+  updatedAt: number;
+}
+
+export interface HexDumpRow {
+  offset: number;
+  offsetHex: string;
+  leftBytes: Array<number | null>;
+  rightBytes: Array<number | null>;
+  ascii: string;
+}
+
+export interface HexDumpPayload {
+  path: string;
+  totalBytes: number;
+  bytes: Uint8Array;
+}
+
+export interface WorkspaceTreeFolderNode {
+  kind: 'folder';
+  path: string;
+  name: string;
+  depth: number;
+  children: WorkspaceTreeNode[];
+  fileCount: number;
+}
+
+export interface WorkspaceTreeFileNode {
+  kind: 'file';
+  path: string;
+  name: string;
+  depth: number;
+  file: VirtualFile;
+}
+
+export type WorkspaceTreeNode = WorkspaceTreeFolderNode | WorkspaceTreeFileNode;
+
 export type VfsChangeKind = 'created' | 'modified';
 
 export interface VfsSyncDelta {

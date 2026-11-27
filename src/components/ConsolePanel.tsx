@@ -5,22 +5,31 @@ import {
   useMemo,
   useRef,
   useState,
+  type FormEvent,
   type KeyboardEvent,
 } from 'react';
 import {
   AlertCircle,
   AlertTriangle,
+  Binary,
   Check,
   ChevronDown,
   ChevronUp,
   Copy,
   CornerDownLeft,
+  FileBox,
+  FileCode2,
+  FileText,
   Info,
   Loader2,
+  Terminal,
   Trash2,
 } from 'lucide-react';
 import type { CompilerDiagnostic, ConsoleChunk, RunStatus } from '../types/compiler';
 import { summarizeDiagnostics } from '../utils/diagnostics';
+import type { VirtualFile } from '../vfs/types';
+import { formatFileSize, isBinaryFileName, isCppSyntaxFile } from '../vfs/vfsHelpers';
+import { HexDumpView } from './HexDumpView';
 
 export interface ConsolePanelHandle {
   focusInput: () => void;
@@ -37,11 +46,14 @@ interface ConsolePanelProps {
   exitCode: number | null;
   exitReason: string | null;
   fontSize: number;
+  files: VirtualFile[];
   onSendInput: (line: string) => void;
   onSendEof: () => void;
   onStop: () => void;
   onClear: () => void;
   onJumpToDiagnostic: (line: number, column?: number | null) => void;
+  onHexDumpFile: (path: string) => void;
+  onRunConsoleCommand: (command: string) => void;
 }
 
 export const ConsolePanel = forwardRef<ConsolePanelHandle, ConsolePanelProps>(function ConsolePanel(
@@ -56,21 +68,28 @@ export const ConsolePanel = forwardRef<ConsolePanelHandle, ConsolePanelProps>(fu
     exitCode,
     exitReason,
     fontSize,
+    files,
     onSendInput,
     onSendEof,
     onStop,
     onClear,
     onJumpToDiagnostic,
+    onHexDumpFile,
+    onRunConsoleCommand,
   },
   ref
 ) {
   const [inputValue, setInputValue] = useState('');
+  const [commandValue, setCommandValue] = useState('');
   const [copied, setCopied] = useState(false);
   const [errorViewMode, setErrorViewMode] = useState<'parsed' | 'raw'>('parsed');
   const [warningsExpanded, setWarningsExpanded] = useState(false);
+  const [hexMenuOpen, setHexMenuOpen] = useState(false);
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
+  const commandInputRef = useRef<HTMLInputElement | null>(null);
+  const hexMenuRef = useRef<HTMLDivElement | null>(null);
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -79,11 +98,36 @@ export const ConsolePanel = forwardRef<ConsolePanelHandle, ConsolePanelProps>(fu
     };
   }, []);
 
+  // Close Hex-дамп dropdown on outside click or Escape
+  useEffect(() => {
+    if (!hexMenuOpen) return;
+    const onPointerDown = (e: MouseEvent) => {
+      if (hexMenuRef.current && !hexMenuRef.current.contains(e.target as Node)) {
+        setHexMenuOpen(false);
+      }
+    };
+    const onKeyDown = (e: globalThis.KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setHexMenuOpen(false);
+      }
+    };
+    window.addEventListener('mousedown', onPointerDown);
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      window.removeEventListener('mousedown', onPointerDown);
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [hexMenuOpen]);
+
   const summary = useMemo(() => summarizeDiagnostics(diagnostics), [diagnostics]);
 
   useImperativeHandle(ref, () => ({
     focusInput() {
-      inputRef.current?.focus();
+      if (status === 'running') {
+        inputRef.current?.focus();
+      } else {
+        commandInputRef.current?.focus();
+      }
     },
   }));
 
@@ -131,6 +175,21 @@ export const ConsolePanel = forwardRef<ConsolePanelHandle, ConsolePanelProps>(fu
     if (e.ctrlKey && e.key.toLowerCase() === 'd' && inputValue === '') {
       e.preventDefault();
       onSendEof();
+    }
+  };
+
+  const handleSubmitCommand = (e?: FormEvent) => {
+    if (e) e.preventDefault();
+    const trimmed = commandValue.trim();
+    if (!trimmed) return;
+    onRunConsoleCommand(trimmed);
+    setCommandValue('');
+  };
+
+  const handleCommandKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter' && !e.metaKey && !e.ctrlKey) {
+      e.preventDefault();
+      handleSubmitCommand();
     }
   };
 
@@ -186,9 +245,9 @@ export const ConsolePanel = forwardRef<ConsolePanelHandle, ConsolePanelProps>(fu
       data-testid="console-panel"
       className="flex h-full w-full flex-col bg-[var(--app-console)]"
     >
-      {/* Console pane header */}
-      <div className="flex h-10 shrink-0 items-center justify-between gap-3 border-b border-[var(--app-border)] bg-[var(--app-surface)] px-3.5">
-        <div className="flex min-w-0 items-center gap-2.5">
+      {/* Console pane header (touch targets >= 44px) */}
+      <div className="flex min-h-[44px] shrink-0 items-center justify-between gap-2 border-b border-[var(--app-border)] bg-[var(--app-surface)] px-2.5 sm:px-3.5">
+        <div className="flex min-w-0 items-center gap-2">
           <span className="text-xs font-semibold text-[var(--app-text)] whitespace-nowrap">
             Консоль
           </span>
@@ -211,17 +270,88 @@ export const ConsolePanel = forwardRef<ConsolePanelHandle, ConsolePanelProps>(fu
           </span>
         </div>
 
-        <div className="flex shrink-0 items-center gap-1">
+        <div className="flex shrink-0 items-center gap-0.5 sm:gap-1">
           {status === 'running' && (
             <button
               type="button"
               onClick={onSendEof}
               title="Отправить конец ввода (Ctrl+D)"
-              className="inline-flex h-7 items-center rounded-md px-2 text-xs font-medium text-[var(--app-text-secondary)] transition-colors hover:bg-[var(--app-hover)] hover:text-[var(--app-text)] whitespace-nowrap"
+              className="inline-flex min-h-[44px] min-w-[44px] items-center justify-center rounded-md px-2 text-xs font-medium text-[var(--app-text-secondary)] transition-colors hover:bg-[var(--app-hover)] hover:text-[var(--app-text)] whitespace-nowrap"
             >
               EOF
             </button>
           )}
+
+          {/* Compact Hex-дамп file selector dropdown */}
+          <div ref={hexMenuRef} className="relative">
+            <button
+              type="button"
+              data-testid="console-hexdump-trigger"
+              aria-label="Hex-дамп файла"
+              aria-haspopup="menu"
+              aria-expanded={hexMenuOpen}
+              title="Показать Hex-дамп файла в консоли"
+              onClick={() => setHexMenuOpen((prev) => !prev)}
+              className={`inline-flex min-h-[44px] min-w-[44px] items-center justify-center gap-1 rounded-md px-2 text-xs font-medium transition-colors whitespace-nowrap ${
+                hexMenuOpen
+                  ? 'bg-[var(--app-accent-soft)] text-[var(--app-text)]'
+                  : 'text-[var(--app-text-secondary)] hover:bg-[var(--app-hover)] hover:text-[var(--app-text)]'
+              }`}
+            >
+              <Binary className="h-3.5 w-3.5 shrink-0" />
+              <span className="hidden min-[460px]:inline">Hex-дамп</span>
+              <ChevronDown className="h-3 w-3 shrink-0 opacity-75" />
+            </button>
+
+            {hexMenuOpen && (
+              <div
+                role="menu"
+                aria-label="Выбор файла для Hex-дампа"
+                data-testid="console-hexdump-menu"
+                className="absolute right-0 top-full z-30 mt-1 max-h-72 w-64 max-w-[85vw] overflow-y-auto rounded-lg border border-[var(--app-border-strong)] bg-[var(--app-elevated)] p-1 shadow-xl"
+              >
+                <div className="px-2.5 py-1.5 text-[11px] font-semibold uppercase tracking-wide text-[var(--app-text-muted)]">
+                  Выбрать файл для Hex-дампа
+                </div>
+                {files.length === 0 ? (
+                  <div className="px-2.5 py-2 text-xs text-[var(--app-text-muted)]">
+                    Нет файлов в рабочей области
+                  </div>
+                ) : (
+                  files.map((file) => {
+                    const isBin = Boolean(file.isBinary || isBinaryFileName(file.name));
+                    const isCpp = isCppSyntaxFile(file.name);
+                    return (
+                      <button
+                        key={file.name}
+                        type="button"
+                        role="menuitem"
+                        onClick={() => {
+                          onHexDumpFile(file.name);
+                          setHexMenuOpen(false);
+                        }}
+                        className="flex min-h-[44px] w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-left text-xs text-[var(--app-text)] transition-colors hover:bg-[var(--app-hover)]"
+                      >
+                        {isBin ? (
+                          <FileBox className="h-3.5 w-3.5 shrink-0 text-amber-500 dark:text-amber-400" />
+                        ) : isCpp ? (
+                          <FileCode2 className="h-3.5 w-3.5 shrink-0 text-[var(--app-accent)]" />
+                        ) : (
+                          <FileText className="h-3.5 w-3.5 shrink-0 text-[var(--app-text-secondary)]" />
+                        )}
+                        <span className="min-w-0 flex-1 truncate font-mono" title={file.name}>
+                          {file.name}
+                        </span>
+                        <span className="shrink-0 font-mono text-[11px] text-[var(--app-text-muted)] tabular-nums">
+                          {formatFileSize(file.size)}
+                        </span>
+                      </button>
+                    );
+                  })
+                )}
+              </div>
+            )}
+          </div>
 
           <button
             type="button"
@@ -229,7 +359,7 @@ export const ConsolePanel = forwardRef<ConsolePanelHandle, ConsolePanelProps>(fu
             disabled={!hasCopyableContent}
             aria-label="Копировать вывод консоли"
             title="Копировать вывод"
-            className="inline-flex h-7 items-center gap-1.5 rounded-md px-2 text-xs font-medium text-[var(--app-text-secondary)] transition-colors hover:bg-[var(--app-hover)] hover:text-[var(--app-text)] disabled:cursor-not-allowed disabled:opacity-40 whitespace-nowrap"
+            className="inline-flex min-h-[44px] min-w-[44px] items-center justify-center gap-1.5 rounded-md px-2 text-xs font-medium text-[var(--app-text-secondary)] transition-colors hover:bg-[var(--app-hover)] hover:text-[var(--app-text)] disabled:cursor-not-allowed disabled:opacity-40 whitespace-nowrap"
           >
             {copied ? (
               <Check className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />
@@ -244,7 +374,7 @@ export const ConsolePanel = forwardRef<ConsolePanelHandle, ConsolePanelProps>(fu
             onClick={onClear}
             aria-label="Очистить консоль"
             title="Очистить консоль (⌘K)"
-            className="inline-flex h-7 items-center gap-1.5 rounded-md px-2 text-xs font-medium text-[var(--app-text-secondary)] transition-colors hover:bg-[var(--app-hover)] hover:text-[var(--app-text)] whitespace-nowrap"
+            className="inline-flex min-h-[44px] min-w-[44px] items-center justify-center gap-1.5 rounded-md px-2 text-xs font-medium text-[var(--app-text-secondary)] transition-colors hover:bg-[var(--app-hover)] hover:text-[var(--app-text)] whitespace-nowrap"
           >
             <Trash2 className="h-3.5 w-3.5" />
             <span className="hidden sm:inline">Очистить</span>
@@ -259,7 +389,7 @@ export const ConsolePanel = forwardRef<ConsolePanelHandle, ConsolePanelProps>(fu
             type="button"
             onClick={() => setWarningsExpanded((v) => !v)}
             aria-expanded={warningsExpanded}
-            className="flex w-full items-center justify-between px-3.5 py-2 text-left text-xs font-medium text-amber-800 transition-colors hover:bg-amber-100/60 dark:text-amber-300 dark:hover:bg-amber-900/20"
+            className="flex min-h-[44px] w-full items-center justify-between px-3.5 py-2 text-left text-xs font-medium text-amber-800 transition-colors hover:bg-amber-100/60 dark:text-amber-300 dark:hover:bg-amber-900/20"
           >
             <span className="flex items-center gap-2">
               <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
@@ -280,7 +410,7 @@ export const ConsolePanel = forwardRef<ConsolePanelHandle, ConsolePanelProps>(fu
                     key={diag.id}
                     type="button"
                     onClick={() => diag.line && onJumpToDiagnostic(diag.line, diag.column)}
-                    className="flex w-full items-baseline gap-2.5 px-3.5 py-2 text-left font-mono text-xs text-amber-900 transition-colors hover:bg-amber-100/70 dark:text-amber-200 dark:hover:bg-amber-900/30"
+                    className="flex min-h-[44px] w-full items-baseline gap-2.5 px-3.5 py-2 text-left font-mono text-xs text-amber-900 transition-colors hover:bg-amber-100/70 dark:text-amber-200 dark:hover:bg-amber-900/30"
                   >
                     {diag.line !== null && (
                       <span className="shrink-0 font-semibold tabular-nums">
@@ -299,7 +429,7 @@ export const ConsolePanel = forwardRef<ConsolePanelHandle, ConsolePanelProps>(fu
       <div
         ref={scrollRef}
         onClick={handleBodyClick}
-        className={`min-h-0 flex-1 overflow-y-auto px-3 py-3 sm:px-4 sm:py-4 pb-[max(5.5rem,env(safe-area-inset-bottom))] ${
+        className={`min-h-0 flex-1 overflow-y-auto px-3 py-3 sm:px-4 sm:py-4 ${
           status === 'running' ? 'cursor-text' : ''
         }`}
         style={{ fontSize: `${fontSize}px`, lineHeight: 1.6 }}
@@ -454,7 +584,12 @@ export const ConsolePanel = forwardRef<ConsolePanelHandle, ConsolePanelProps>(fu
               на Magic Keyboard, чтобы скомпилировать и запустить программу.
             </p>
             <p className="mt-2 text-xs leading-relaxed text-[var(--app-text-muted)]">
-              Во время выполнения числа и строки вводятся прямо здесь — так же, как в консоли Programiz.
+              Во время выполнения числа и строки вводятся прямо здесь. Для просмотра бинарных файлов используйте{' '}
+              <strong className="font-medium text-[var(--app-text-secondary)]">Hex-дамп</strong> или команду{' '}
+              <code className="rounded bg-[var(--app-surface)] px-1 py-0.5 font-mono text-[var(--app-text-secondary)]">
+                hexdump &lt;путь&gt;
+              </code>{' '}
+              ниже.
             </p>
           </div>
         )}
@@ -465,6 +600,9 @@ export const ConsolePanel = forwardRef<ConsolePanelHandle, ConsolePanelProps>(fu
             className="font-mono whitespace-pre-wrap break-words text-[var(--app-text)]"
           >
             {chunks.map((chunk) => {
+              if (chunk.kind === 'hexdump' && chunk.hexDump) {
+                return <HexDumpView key={chunk.id} payload={chunk.hexDump} />;
+              }
               if (chunk.kind === 'stdin') {
                 return (
                   <span
@@ -522,21 +660,55 @@ export const ConsolePanel = forwardRef<ConsolePanelHandle, ConsolePanelProps>(fu
         )}
       </div>
 
-      {/* Subtle interactive input helper bar ONLY while program is actively running */}
+      {/* Interactive stdin helper bar while program is actively running */}
       {status === 'running' && (
-        <div className="flex shrink-0 items-center justify-between gap-3 border-t border-[var(--app-border)] bg-[var(--app-surface)] px-3.5 py-2">
+        <div className="flex shrink-0 items-center justify-between gap-2 border-t border-[var(--app-border)] bg-[var(--app-surface)] px-3 py-1.5 pb-[max(0.375rem,env(safe-area-inset-bottom))]">
           <span className="truncate text-xs text-[var(--app-text-secondary)]">
             Печатайте прямо в консоли и нажмите Enter для отправки ввода
           </span>
           <button
             type="button"
             onClick={handleSubmitLine}
-            className="inline-flex h-7 shrink-0 items-center gap-1.5 rounded-md border border-[var(--app-border-strong)] bg-[var(--app-elevated)] px-2.5 text-xs font-medium text-[var(--app-text)] transition-colors hover:bg-[var(--app-hover)] whitespace-nowrap"
+            className="inline-flex min-h-[44px] shrink-0 items-center gap-1.5 rounded-md border border-[var(--app-border-strong)] bg-[var(--app-elevated)] px-3 text-xs font-medium text-[var(--app-text)] transition-colors hover:bg-[var(--app-hover)] whitespace-nowrap"
           >
             <CornerDownLeft className="h-3.5 w-3.5" />
             <span>Отправить</span>
           </button>
         </div>
+      )}
+
+      {/* Idle Console Command Bar (supports `hexdump <path>` when no program is running) */}
+      {status !== 'running' && status !== 'compiling' && (
+        <form
+          onSubmit={handleSubmitCommand}
+          className="flex shrink-0 items-center gap-2 border-t border-[var(--app-border)] bg-[var(--app-surface)] px-2.5 py-1.5 pb-[max(0.375rem,env(safe-area-inset-bottom))]"
+        >
+          <Terminal className="h-4 w-4 shrink-0 text-[var(--app-text-muted)]" />
+          <input
+            ref={commandInputRef}
+            type="text"
+            data-testid="console-command-input"
+            value={commandValue}
+            onChange={(e) => setCommandValue(e.target.value)}
+            onKeyDown={handleCommandKeyDown}
+            aria-label="Команда консоли (например, hexdump файл)"
+            placeholder="hexdump <путь к файлу>"
+            spellCheck={false}
+            autoCorrect="off"
+            autoCapitalize="off"
+            autoComplete="off"
+            className="min-h-[44px] min-w-0 flex-1 bg-transparent font-mono text-xs text-[var(--app-text)] placeholder:text-[var(--app-text-muted)] outline-none"
+          />
+          <button
+            type="submit"
+            disabled={commandValue.trim().length === 0}
+            aria-label="Выполнить команду консоли"
+            className="inline-flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center gap-1 rounded-md border border-[var(--app-border-strong)] bg-[var(--app-elevated)] px-2.5 text-xs font-medium text-[var(--app-text)] transition-colors hover:bg-[var(--app-hover)] disabled:cursor-not-allowed disabled:opacity-40 whitespace-nowrap"
+          >
+            <CornerDownLeft className="h-3.5 w-3.5" />
+            <span className="hidden sm:inline">Выполнить</span>
+          </button>
+        </form>
       )}
     </section>
   );

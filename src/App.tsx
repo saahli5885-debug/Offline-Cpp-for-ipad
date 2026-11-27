@@ -52,23 +52,33 @@ import {
 } from './utils/layout';
 import {
   applyVfsDeltaToIdb,
+  applyWorkspaceMutationToIdb,
   deleteFileFromIdb,
   loadAllFilesFromIdb,
+  loadAllFoldersFromIdb,
   putFilesBatchToIdb,
   putFileToIdb,
+  putFoldersBatchToIdb,
   renameFileInIdb,
 } from './vfs/idbStorage';
-import type { VfsChangeKind, VirtualFile } from './vfs/types';
+import type { HexDumpPayload, VfsChangeKind, VirtualFile, VirtualFolder } from './vfs/types';
 import {
   cloneBytes,
   computeVfsDelta,
   createVirtualFile,
+  createVirtualFolder,
+  deleteFolderPaths,
   detectLanguageFromFileName,
+  formatCanonicalHexDumpText,
+  getParentFolderPaths,
   isBinaryFileName,
   isCppSyntaxFile,
-  normalizeVirtualPath,
+  isDirectoryPath,
+  normalizePath,
+  renameFolderPaths,
   sortVirtualFiles,
   validateFileName,
+  validateFolderName,
 } from './vfs/vfsHelpers';
 import { exportSingleFileToDevice, exportWorkspaceZipToDevice } from './vfs/zipExport';
 
@@ -137,11 +147,12 @@ export default function App() {
   const [filesMap, setFilesMap] = useState<Record<string, VirtualFile>>(() =>
     createInitialFilesMap()
   );
+  const [foldersMap, setFoldersMap] = useState<Record<string, VirtualFolder>>({});
 
   const [activeFileName, setActiveFileName] = useState<string>(() => {
     const savedLang = safeReadStorage(STORAGE_KEYS.language, 'cpp') === 'c' ? 'c' : 'cpp';
     const fallback = savedLang === 'c' ? 'main.c' : 'main.cpp';
-    const savedActive = normalizeVirtualPath(safeReadStorage(STORAGE_KEYS.activeFile, fallback));
+    const savedActive = normalizePath(safeReadStorage(STORAGE_KEYS.activeFile, fallback));
     return savedActive || fallback;
   });
 
@@ -230,6 +241,8 @@ export default function App() {
 
   const filesRef = useRef(filesMap);
   filesRef.current = filesMap;
+  const foldersRef = useRef(foldersMap);
+  foldersRef.current = foldersMap;
   const activeFileRef = useRef(activeFileName);
   activeFileRef.current = activeFileName;
   const autosaveEnabledRef = useRef(autosaveEnabled);
@@ -262,6 +275,8 @@ export default function App() {
     () => sortVirtualFiles(Object.values(filesMap), primaryEntryFile),
     [filesMap, primaryEntryFile]
   );
+
+  const folderList = useMemo(() => Object.values(foldersMap), [foldersMap]);
 
   const currentFile = filesMap[activeFileName] ?? filesMap[primaryEntryFile];
   const currentContent = currentFile?.content ?? '';
@@ -351,31 +366,53 @@ export default function App() {
     [persistFile]
   );
 
-  // Hydrate persistent Virtual Workspace from IndexedDB on startup
+  // Hydrate persistent Virtual Workspace (files + folders) from IndexedDB on startup
   useEffect(() => {
     let cancelled = false;
 
     void (async () => {
       try {
-        const storedFiles = await loadAllFilesFromIdb();
+        const [storedFiles, storedFolders] = await Promise.all([
+          loadAllFilesFromIdb(),
+          loadAllFoldersFromIdb(),
+        ]);
         if (cancelled) return;
+
+        const nextFolders: Record<string, VirtualFolder> = {};
+        for (const folder of storedFolders) {
+          if (folder.path) {
+            nextFolders[folder.path] = folder;
+          }
+        }
 
         if (storedFiles.length === 0) {
           // First visit: seed IndexedDB with default main.cpp, main.c, and sample input.txt
           await putFilesBatchToIdb(Object.values(filesRef.current));
+          if (Object.keys(nextFolders).length > 0) {
+            foldersRef.current = nextFolders;
+            setFoldersMap(nextFolders);
+          }
           return;
         }
 
         const nextMap: Record<string, VirtualFile> = {};
+        const now = Date.now();
         for (const f of storedFiles) {
           nextMap[f.name] = f;
+          for (const parent of getParentFolderPaths(f.name)) {
+            if (!nextFolders[parent]) {
+              nextFolders[parent] = createVirtualFolder(parent, now);
+            }
+          }
         }
         // Ensure entry source files always exist
         if (!nextMap['main.cpp']) {
-          nextMap['main.cpp'] = filesRef.current['main.cpp'] ?? createVirtualFile('main.cpp', DEFAULT_CODE.cpp);
+          nextMap['main.cpp'] =
+            filesRef.current['main.cpp'] ?? createVirtualFile('main.cpp', DEFAULT_CODE.cpp);
         }
         if (!nextMap['main.c']) {
-          nextMap['main.c'] = filesRef.current['main.c'] ?? createVirtualFile('main.c', DEFAULT_CODE.c);
+          nextMap['main.c'] =
+            filesRef.current['main.c'] ?? createVirtualFile('main.c', DEFAULT_CODE.c);
         }
 
         // Preserve any immediate keystroke made before IDB finished loading
@@ -388,6 +425,8 @@ export default function App() {
 
         filesRef.current = nextMap;
         setFilesMap(nextMap);
+        foldersRef.current = nextFolders;
+        setFoldersMap(nextFolders);
         syncEntryLocalStorage(nextMap);
 
         if (!nextMap[activeFileRef.current]) {
@@ -435,11 +474,14 @@ export default function App() {
     });
   }, [getLiveActiveContent, persistFile]);
 
-  const appendChunk = useCallback((kind: ConsoleChunk['kind'], text: string) => {
-    chunkCounterRef.current += 1;
-    const id = `c-${chunkCounterRef.current}`;
-    setChunks((prev) => [...prev, { id, kind, text }]);
-  }, []);
+  const appendChunk = useCallback(
+    (kind: ConsoleChunk['kind'], text: string, hexDump?: HexDumpPayload) => {
+      chunkCounterRef.current += 1;
+      const id = `c-${chunkCounterRef.current}`;
+      setChunks((prev) => [...prev, hexDump ? { id, kind, text, hexDump } : { id, kind, text }]);
+    },
+    []
+  );
 
   // Apply selected IDE theme CSS variables, dark class, and PWA theme-color meta
   useEffect(() => {
@@ -629,18 +671,40 @@ export default function App() {
       if (hasStepChanges) {
         const now = Date.now();
         const nextMap: Record<string, VirtualFile> = { ...filesRef.current };
+        const nextFolders: Record<string, VirtualFolder> = { ...foldersRef.current };
         const upserts: VirtualFile[] = [];
+        const folderUpserts: VirtualFolder[] = [];
+
+        const ensureParentFolders = (filePath: string) => {
+          for (const parent of getParentFolderPaths(filePath)) {
+            if (!nextFolders[parent]) {
+              const folder = createVirtualFolder(parent, now);
+              nextFolders[parent] = folder;
+              folderUpserts.push(folder);
+            }
+          }
+        };
 
         for (const createdPath of stepDelta.created) {
-          const vf = createVirtualFile(createdPath, afterMap.get(createdPath) ?? new Uint8Array(0), now);
+          const vf = createVirtualFile(
+            createdPath,
+            afterMap.get(createdPath) ?? new Uint8Array(0),
+            now
+          );
           nextMap[createdPath] = vf;
           upserts.push(vf);
+          ensureParentFolders(createdPath);
           runChangeBadges[createdPath] = 'created';
         }
         for (const modifiedPath of stepDelta.modified) {
-          const vf = createVirtualFile(modifiedPath, afterMap.get(modifiedPath) ?? new Uint8Array(0), now);
+          const vf = createVirtualFile(
+            modifiedPath,
+            afterMap.get(modifiedPath) ?? new Uint8Array(0),
+            now
+          );
           nextMap[modifiedPath] = vf;
           upserts.push(vf);
+          ensureParentFolders(modifiedPath);
           if (runChangeBadges[modifiedPath] !== 'created') {
             runChangeBadges[modifiedPath] = 'modified';
           }
@@ -652,6 +716,10 @@ export default function App() {
 
         filesRef.current = nextMap;
         setFilesMap(nextMap);
+        if (folderUpserts.length > 0) {
+          foldersRef.current = nextFolders;
+          setFoldersMap(nextFolders);
+        }
         setRecentVfsChanges({ ...runChangeBadges });
         syncEntryLocalStorage(nextMap, now);
 
@@ -660,7 +728,7 @@ export default function App() {
           setActiveFileName(entryName);
         }
 
-        void applyVfsDeltaToIdb(upserts, stepDelta.deleted)
+        void applyVfsDeltaToIdb(upserts, stepDelta.deleted, folderUpserts)
           .then(() => {
             setStorageError(null);
             safeWriteStorage(STORAGE_KEYS.lastSavedAt, String(now), undefined, now);
@@ -687,6 +755,7 @@ export default function App() {
     let session: BrowserCppSession | null = null;
     session = new BrowserCppSession(compiled.program, {
       initialFiles: vfsBytesRecord,
+      initialFolders: Object.keys(foldersRef.current),
       onStdout: (data) => {
         if (sessionRef.current !== session) return;
         appendChunk('stdout', data);
@@ -820,19 +889,51 @@ export default function App() {
 
   const handleCreateFile = useCallback(
     (rawName: string): { ok: boolean; error?: string } => {
-      const check = validateFileName(rawName, Object.keys(filesRef.current));
+      const check = validateFileName(
+        rawName,
+        Object.keys(filesRef.current),
+        undefined,
+        Object.keys(foldersRef.current)
+      );
       if (!check.ok) {
         return { ok: false, error: check.error };
       }
       flushActiveEditorBuffer();
-      const newFile = createVirtualFile(check.normalized, '');
+      const now = Date.now();
+      const newFile = createVirtualFile(check.normalized, '', now);
       const nextMap = { ...filesRef.current, [newFile.name]: newFile };
       filesRef.current = nextMap;
       setFilesMap(nextMap);
+
+      const newFolders: VirtualFolder[] = [];
+      const nextFolders = { ...foldersRef.current };
+      for (const parent of getParentFolderPaths(newFile.name)) {
+        if (!nextFolders[parent]) {
+          const folder = createVirtualFolder(parent, now);
+          nextFolders[parent] = folder;
+          newFolders.push(folder);
+        }
+      }
+      if (newFolders.length > 0) {
+        foldersRef.current = nextFolders;
+        setFoldersMap(nextFolders);
+      }
+
       activeFileRef.current = newFile.name;
       setActiveFileName(newFile.name);
 
-      void persistFile(newFile, nextMap);
+      if (newFolders.length > 0) {
+        syncEntryLocalStorage(nextMap, now);
+        void applyWorkspaceMutationToIdb([newFile], [], newFolders, [])
+          .then(() => {
+            setStorageError(null);
+            safeWriteStorage(STORAGE_KEYS.lastSavedAt, String(now), undefined, now);
+            setLastSavedAt(now);
+          })
+          .catch((err) => reportStorageError(`Не удалось сохранить «${newFile.name}» в IndexedDB`, err));
+      } else {
+        void persistFile(newFile, nextMap);
+      }
       showVfsStatus(`Создан файл: ${newFile.name}`);
 
       if (effectiveLayout === 'tabs') {
@@ -843,7 +944,15 @@ export default function App() {
       }
       return { ok: true };
     },
-    [effectiveLayout, flushActiveEditorBuffer, persistFile, showVfsStatus, viewport.width]
+    [
+      effectiveLayout,
+      flushActiveEditorBuffer,
+      persistFile,
+      reportStorageError,
+      showVfsStatus,
+      syncEntryLocalStorage,
+      viewport.width,
+    ]
   );
 
   const handleRenameFile = useCallback(
@@ -852,7 +961,12 @@ export default function App() {
       if (!current) {
         return { ok: false, error: 'Файл не найден.' };
       }
-      const check = validateFileName(rawNewName, Object.keys(filesRef.current), oldName);
+      const check = validateFileName(
+        rawNewName,
+        Object.keys(filesRef.current),
+        oldName,
+        Object.keys(foldersRef.current)
+      );
       if (!check.ok) {
         return { ok: false, error: check.error };
       }
@@ -860,14 +974,29 @@ export default function App() {
       if (nextName === oldName) return { ok: true };
 
       const syncedMap = flushActiveEditorBuffer();
+      const now = Date.now();
       const latestOld = syncedMap[oldName] ?? current;
-      const renamedFile = createVirtualFile(nextName, latestOld.bytes);
+      const renamedFile = createVirtualFile(nextName, latestOld.bytes, now);
 
       const nextMap: Record<string, VirtualFile> = { ...syncedMap };
       delete nextMap[oldName];
       nextMap[nextName] = renamedFile;
       filesRef.current = nextMap;
       setFilesMap(nextMap);
+
+      const folderUpserts: VirtualFolder[] = [];
+      const nextFolders = { ...foldersRef.current };
+      for (const parent of getParentFolderPaths(nextName)) {
+        if (!nextFolders[parent]) {
+          const folder = createVirtualFolder(parent, now);
+          nextFolders[parent] = folder;
+          folderUpserts.push(folder);
+        }
+      }
+      if (folderUpserts.length > 0) {
+        foldersRef.current = nextFolders;
+        setFoldersMap(nextFolders);
+      }
 
       setRecentVfsChanges((prev) => {
         if (!prev[oldName]) return prev;
@@ -882,8 +1011,8 @@ export default function App() {
         setActiveFileName(nextName);
       }
 
-      syncEntryLocalStorage(nextMap);
-      void renameFileInIdb(oldName, renamedFile)
+      syncEntryLocalStorage(nextMap, now);
+      void renameFileInIdb(oldName, renamedFile, folderUpserts)
         .then(() => setStorageError(null))
         .catch((err) => reportStorageError(`Не удалось переименовать «${oldName}»`, err));
       showVfsStatus(`Переименовано: ${nextName}`);
@@ -923,6 +1052,233 @@ export default function App() {
     [flushActiveEditorBuffer, primaryEntryFile, reportStorageError, showVfsStatus]
   );
 
+  const handleCreateFolder = useCallback(
+    (rawPath: string): { ok: boolean; error?: string } => {
+      const check = validateFolderName(
+        rawPath,
+        Object.keys(foldersRef.current),
+        Object.keys(filesRef.current)
+      );
+      if (!check.ok) {
+        return { ok: false, error: check.error };
+      }
+      const now = Date.now();
+      const nextFolders: Record<string, VirtualFolder> = { ...foldersRef.current };
+      const created: VirtualFolder[] = [];
+      for (const path of [...getParentFolderPaths(check.normalized), check.normalized]) {
+        if (path && !nextFolders[path]) {
+          const folder = createVirtualFolder(path, now);
+          nextFolders[path] = folder;
+          created.push(folder);
+        }
+      }
+      foldersRef.current = nextFolders;
+      setFoldersMap(nextFolders);
+
+      void putFoldersBatchToIdb(created)
+        .then(() => {
+          setStorageError(null);
+          safeWriteStorage(STORAGE_KEYS.lastSavedAt, String(now), undefined, now);
+          setLastSavedAt(now);
+        })
+        .catch((err) => reportStorageError(`Не удалось создать папку «${check.normalized}»`, err));
+      showVfsStatus(`Создана папка: ${check.normalized}`);
+      return { ok: true };
+    },
+    [reportStorageError, showVfsStatus]
+  );
+
+  const handleRenameFolder = useCallback(
+    (oldPath: string, rawNewPath: string): { ok: boolean; error?: string } => {
+      const check = validateFolderName(
+        rawNewPath,
+        Object.keys(foldersRef.current),
+        Object.keys(filesRef.current),
+        oldPath
+      );
+      if (!check.ok) {
+        return { ok: false, error: check.error };
+      }
+      if (check.normalized === oldPath) return { ok: true };
+
+      const syncedMap = flushActiveEditorBuffer();
+      const now = Date.now();
+      const result = renameFolderPaths(
+        syncedMap,
+        foldersRef.current,
+        oldPath,
+        check.normalized,
+        now
+      );
+
+      filesRef.current = result.nextFilesMap;
+      setFilesMap(result.nextFilesMap);
+      foldersRef.current = result.nextFoldersMap;
+      setFoldersMap(result.nextFoldersMap);
+
+      const remappedActive = result.pathRemap.get(activeFileRef.current);
+      if (remappedActive) {
+        activeFileRef.current = remappedActive;
+        setActiveFileName(remappedActive);
+      }
+
+      setRecentVfsChanges((prev) => {
+        let changed = false;
+        const next: Record<string, VfsChangeKind> = {};
+        for (const [k, v] of Object.entries(prev)) {
+          const mapped = result.pathRemap.get(k);
+          if (mapped) {
+            next[mapped] = v;
+            changed = true;
+          } else {
+            next[k] = v;
+          }
+        }
+        return changed ? next : prev;
+      });
+
+      syncEntryLocalStorage(result.nextFilesMap, now);
+      void applyWorkspaceMutationToIdb(
+        result.fileUpserts,
+        result.fileDeletes,
+        result.folderUpserts,
+        result.folderDeletes
+      )
+        .then(() => {
+          setStorageError(null);
+          safeWriteStorage(STORAGE_KEYS.lastSavedAt, String(now), undefined, now);
+          setLastSavedAt(now);
+        })
+        .catch((err) => reportStorageError(`Не удалось переименовать папку «${oldPath}»`, err));
+      showVfsStatus(`Папка переименована: ${check.normalized}`);
+      return { ok: true };
+    },
+    [flushActiveEditorBuffer, reportStorageError, showVfsStatus, syncEntryLocalStorage]
+  );
+
+  const handleDeleteFolder = useCallback(
+    (folderPath: string) => {
+      const syncedMap = flushActiveEditorBuffer();
+      const result = deleteFolderPaths(
+        syncedMap,
+        foldersRef.current,
+        folderPath,
+        primaryEntryFile
+      );
+
+      filesRef.current = result.nextFilesMap;
+      setFilesMap(result.nextFilesMap);
+      foldersRef.current = result.nextFoldersMap;
+      setFoldersMap(result.nextFoldersMap);
+
+      if (!result.nextFilesMap[activeFileRef.current]) {
+        activeFileRef.current = primaryEntryFile;
+        setActiveFileName(primaryEntryFile);
+      }
+
+      if (result.fileDeletes.length > 0) {
+        const deletedSet = new Set(result.fileDeletes);
+        setRecentVfsChanges((prev) => {
+          const copy = { ...prev };
+          for (const d of deletedSet) delete copy[d];
+          return copy;
+        });
+      }
+
+      void applyWorkspaceMutationToIdb([], result.fileDeletes, [], result.folderDeletes)
+        .then(() => setStorageError(null))
+        .catch((err) => reportStorageError(`Не удалось удалить папку «${folderPath}»`, err));
+      showVfsStatus(`Удалена папка: ${folderPath}`);
+    },
+    [flushActiveEditorBuffer, primaryEntryFile, reportStorageError, showVfsStatus]
+  );
+
+  const handleHexDumpFile = useCallback(
+    (rawPath: string) => {
+      const syncedMap = flushActiveEditorBuffer();
+      const normalized = normalizePath(rawPath);
+
+      if (status === 'compile_error') {
+        setStatus('idle');
+      }
+
+      if (!normalized) {
+        appendChunk('stderr', 'Hex-дамп: укажите путь к файлу.\n');
+        if (effectiveLayout === 'tabs') setActiveTab('console');
+        return;
+      }
+
+      const target = syncedMap[normalized];
+      if (!target) {
+        if (isDirectoryPath(normalized, Object.keys(syncedMap), Object.keys(foldersRef.current))) {
+          appendChunk('stderr', `Hex-дамп: «${normalized}» является папкой, а не файлом.\n`);
+        } else {
+          appendChunk('stderr', `Hex-дамп: файл «${normalized}» не найден.\n`);
+        }
+        if (effectiveLayout === 'tabs') setActiveTab('console');
+        return;
+      }
+
+      // Read raw Uint8Array bytes directly without UTF-8 decoding
+      const rawBytes = cloneBytes(target.bytes);
+      const plainText = formatCanonicalHexDumpText(target.name, rawBytes);
+      appendChunk('hexdump', plainText, {
+        path: target.name,
+        totalBytes: rawBytes.byteLength,
+        bytes: rawBytes,
+      });
+
+      if (effectiveLayout === 'tabs') {
+        setActiveTab('console');
+      }
+      if (viewport.width < 1024) {
+        setSidebarOpen(false);
+      }
+    },
+    [appendChunk, effectiveLayout, flushActiveEditorBuffer, status, viewport.width]
+  );
+
+  const handleRunConsoleCommand = useCallback(
+    (rawCommand: string) => {
+      const trimmed = rawCommand.trim();
+      if (!trimmed) return;
+
+      if (status === 'compile_error') {
+        setStatus('idle');
+      }
+
+      const lower = trimmed.toLowerCase();
+      if (lower === 'clear' || lower === 'cls') {
+        handleClearConsole();
+        return;
+      }
+
+      appendChunk('stdin', `$ ${trimmed}\n`);
+
+      if (lower === 'hexdump' || lower.startsWith('hexdump ')) {
+        let arg = trimmed.slice(7).trim();
+        if (
+          (arg.startsWith('"') && arg.endsWith('"')) ||
+          (arg.startsWith("'") && arg.endsWith("'"))
+        ) {
+          arg = arg.slice(1, -1).trim();
+        }
+        if (!arg) {
+          appendChunk('stderr', 'Использование: hexdump <путь к файлу>\n');
+          return;
+        }
+        handleHexDumpFile(arg);
+        return;
+      }
+
+      appendChunk(
+        'stderr',
+        `Неизвестная команда: «${trimmed}». Доступно: hexdump <путь к файлу>, clear\n`
+      );
+    },
+    [appendChunk, handleClearConsole, handleHexDumpFile, status]
+  );
+
   const handleImportFiles = useCallback(
     (fileList: FileList) => {
       const picked = Array.from(fileList);
@@ -932,22 +1288,36 @@ export default function App() {
         try {
           const syncedMap = flushActiveEditorBuffer();
           const nextMap: Record<string, VirtualFile> = { ...syncedMap };
+          const nextFolders: Record<string, VirtualFolder> = { ...foldersRef.current };
           const importedFiles: VirtualFile[] = [];
+          const createdFolders: VirtualFolder[] = [];
+          const now = Date.now();
 
           for (const browserFile of picked) {
-            const normName = normalizeVirtualPath(browserFile.name);
+            const normName = normalizePath(browserFile.name);
             if (!normName) continue;
             const rawBytes = await readBrowserFileBytes(browserFile);
-            const vf = createVirtualFile(normName, rawBytes);
+            const vf = createVirtualFile(normName, rawBytes, now);
             nextMap[vf.name] = vf;
             importedFiles.push(vf);
+            for (const parent of getParentFolderPaths(vf.name)) {
+              if (!nextFolders[parent]) {
+                const folder = createVirtualFolder(parent, now);
+                nextFolders[parent] = folder;
+                createdFolders.push(folder);
+              }
+            }
           }
 
           if (importedFiles.length === 0) return;
 
           filesRef.current = nextMap;
           setFilesMap(nextMap);
-          syncEntryLocalStorage(nextMap);
+          if (createdFolders.length > 0) {
+            foldersRef.current = nextFolders;
+            setFoldersMap(nextFolders);
+          }
+          syncEntryLocalStorage(nextMap, now);
 
           const first = importedFiles[0];
           const detectedLang = detectLanguageFromFileName(first.name);
@@ -959,9 +1329,8 @@ export default function App() {
           activeFileRef.current = first.name;
           setActiveFileName(first.name);
 
-          await putFilesBatchToIdb(importedFiles);
+          await applyWorkspaceMutationToIdb(importedFiles, [], createdFolders, []);
           setStorageError(null);
-          const now = Date.now();
           safeWriteStorage(STORAGE_KEYS.lastSavedAt, String(now), undefined, now);
           setLastSavedAt(now);
 
@@ -1017,17 +1386,36 @@ export default function App() {
 
   const handleExportAllZip = useCallback(() => {
     const syncedMap = flushActiveEditorBuffer();
-    const entries = Object.values(syncedMap).map((f) => ({
+    const filesArr = Object.values(syncedMap);
+    const entries = filesArr.map((f) => ({
       name: f.name,
       content: f.bytes,
       updatedAt: f.updatedAt,
     }));
+
+    // Preserve explicit empty folders in ZIP archive using trailing "/" directory entries
+    const foldersWithFiles = new Set<string>();
+    for (const f of filesArr) {
+      for (const parent of getParentFolderPaths(f.name)) {
+        foldersWithFiles.add(parent);
+      }
+    }
+    for (const folder of Object.values(foldersRef.current)) {
+      if (folder.path && !foldersWithFiles.has(folder.path)) {
+        entries.push({
+          name: `${folder.path}/`,
+          content: new Uint8Array(0),
+          updatedAt: folder.updatedAt,
+        });
+      }
+    }
+
     if (entries.length === 0) return;
 
     void exportWorkspaceZipToDevice(entries, 'cpp-workspace.zip')
       .then((mode) => {
         if (mode !== 'cancelled') {
-          showVfsStatus(`Экспортирован архив (${entries.length} ф.)`);
+          showVfsStatus(`Экспортирован архив (${filesArr.length} ф.)`);
         }
       })
       .catch((err) => {
@@ -1332,6 +1720,7 @@ export default function App() {
           open={sidebarOpen}
           isOverlayDrawer={viewport.width < 1024}
           files={sortedFiles}
+          folders={folderList}
           activeFileName={activeFileName}
           primaryEntryFile={primaryEntryFile}
           recentChanges={recentVfsChanges}
@@ -1342,6 +1731,10 @@ export default function App() {
           onCreateFile={handleCreateFile}
           onRenameFile={handleRenameFile}
           onDeleteFile={handleDeleteFile}
+          onCreateFolder={handleCreateFolder}
+          onRenameFolder={handleRenameFolder}
+          onDeleteFolder={handleDeleteFolder}
+          onHexDumpFile={handleHexDumpFile}
           onImportFiles={handleImportFiles}
           onExportFile={handleExportSingleFile}
           onExportAllZip={handleExportAllZip}
@@ -1380,7 +1773,7 @@ export default function App() {
             }
           >
             {/* Editor sub-header: active file info + back to entry + Autosave toggle + Word Wrap + Format */}
-            <div className="flex h-10 shrink-0 items-center justify-between gap-2 border-b border-[var(--app-border)] bg-[var(--app-surface)] px-3 sm:px-3.5">
+            <div className="flex min-h-[44px] shrink-0 items-center justify-between gap-2 border-b border-[var(--app-border)] bg-[var(--app-surface)] px-3 sm:px-3.5">
               <div className="flex min-w-0 items-center gap-2 text-xs">
                 {activeFileName !== primaryEntryFile && (
                   <button
@@ -1576,11 +1969,14 @@ export default function App() {
               exitCode={exitCode}
               exitReason={exitReason}
               fontSize={fontSize}
+              files={sortedFiles}
               onSendInput={(line) => void handleSendInput(line)}
               onSendEof={() => void handleSendEof()}
               onStop={() => void handleStop()}
               onClear={handleClearConsole}
               onJumpToDiagnostic={handleJumpToDiagnostic}
+              onHexDumpFile={handleHexDumpFile}
+              onRunConsoleCommand={handleRunConsoleCommand}
             />
           </div>
         </main>

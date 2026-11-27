@@ -952,4 +952,88 @@ test('runs built-in binary templates (cpp-binary-fstream and c-binary-stdio) cle
   assert.match(cRes.stdout, /\[2\] Pencil — 4\.50/);
 });
 
+test('supports nested folder paths in <fstream> and <cstdio>, auto-creates parent dirs on write, and rejects opening directories', async () => {
+  const code = `#include <cstdio>
+#include <fstream>
+#include <iostream>
+#include <string>
+using namespace std;
+
+int main() {
+    // 1. Opening a folder path must fail cleanly (NULL / failbit)
+    FILE* dirF = fopen("lab7", "r");
+    ifstream dirIn("lab7");
+    FILE* emptyDirF = fopen("empty_dir", "r");
+    cout << "DIRS=" << (dirF == NULL ? 1 : 0)
+         << "|" << (dirIn.fail() ? 1 : 0)
+         << "|" << (emptyDirF == NULL ? 1 : 0) << "\\n";
+
+    // 2. Read nested file with backslash and dot-slash normalization
+    ifstream in("./lab7\\\\input.txt");
+    int x = 0;
+    string tag;
+    in >> x >> tag;
+    in.close();
+    cout << "IN=" << x << "|" << tag << "\\n";
+
+    // 3. Write binary bytes (including 0x00 and 0xFF) into nested path
+    FILE* wb = fopen("lab7/nested/out.bin", "wb");
+    if (!wb) {
+        cout << "WB_FAIL\\n";
+        return 1;
+    }
+    unsigned char raw[4] = {0x00, 0x41, 0x7f, 0xff};
+    fwrite(raw, 1, 4, wb);
+    fclose(wb);
+
+    // 4. Read back via normalized parent traversal path
+    FILE* rb = fopen("lab7/nested/../nested/out.bin", "rb");
+    unsigned char back[4] = {0, 0, 0, 0};
+    size_t got = fread(back, 1, 4, rb);
+    fclose(rb);
+    cout << "BIN=" << got << "|" << (int)back[0] << "," << (int)back[1] << "," << (int)back[3] << "\\n";
+
+    // 5. Write & rename across nested directories
+    {
+        ofstream out("lab7/temp.txt");
+        out << "moved_ok";
+    }
+    int rn = rename("lab7/temp.txt", "archive/done.txt");
+    cout << "RN=" << rn << "\\n";
+    return 0;
+}`;
+
+  const compiled = compileInBrowser(code, 'cpp', { 'lab7/input.txt': '77 alpha\n' });
+  assert.equal(compiled.ok, true, compiled.rawCompilerOutput);
+
+  let finalSnapshot: Record<string, Uint8Array> = {};
+  let stdout = '';
+  let stderr = '';
+
+  const exitCode = await new Promise<number | null>((resolve) => {
+    const session = new BrowserCppSession(compiled.program!, {
+      initialFiles: { 'lab7/input.txt': '77 alpha\n' },
+      initialFolders: ['empty_dir', 'lab7'],
+      onStdout: (c) => {
+        stdout += c;
+      },
+      onStderr: (c) => {
+        stderr += c;
+      },
+      onVfsFinalSync: (snap) => {
+        finalSnapshot = snap;
+      },
+      onExit: ({ code: c }) => resolve(c),
+    });
+    session.sendEof();
+  });
+
+  assert.equal(exitCode, 0, stderr);
+  assert.equal(stdout, 'DIRS=1|1|1\nIN=77|alpha\nBIN=4|0,65,255\nRN=0\n');
+  assert.deepEqual(Array.from(finalSnapshot['lab7/nested/out.bin']), [0x00, 0x41, 0x7f, 0xff]);
+  assert.equal(decodeUtf8(finalSnapshot['archive/done.txt']), 'moved_ok');
+  assert.equal('lab7/temp.txt' in finalSnapshot, false);
+});
+
+
 

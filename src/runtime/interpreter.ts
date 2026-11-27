@@ -21,7 +21,9 @@ import {
   cloneBytes,
   decodeUtf8,
   encodeUtf8,
-  normalizeVirtualPath,
+  getParentFolderPaths,
+  isDirectoryPath,
+  normalizePath,
   toBytes,
 } from '../vfs/vfsHelpers';
 import {
@@ -386,6 +388,7 @@ export interface RunCallbacks {
   stdin: CharStreamBuffer;
   signal: AbortSignal;
   initialFiles?: Record<string, string | Uint8Array> | Map<string, string | Uint8Array>;
+  initialFolders?: Iterable<string>;
   onVfsChange?: (event: VfsRuntimeChangeEvent) => void;
   onVfsFinalSync?: (snapshot: Record<string, Uint8Array>) => void;
 }
@@ -401,7 +404,16 @@ const MAX_OUTPUT_BYTES = 256 * 1024;
 const MAX_CALL_DEPTH = 512;
 
 export async function runProgram(program: ProgramNode, callbacks: RunCallbacks): Promise<number> {
-  const { onStdout, onStderr, stdin, signal, initialFiles, onVfsChange, onVfsFinalSync } = callbacks;
+  const {
+    onStdout,
+    onStderr,
+    stdin,
+    signal,
+    initialFiles,
+    initialFolders,
+    onVfsChange,
+    onVfsFinalSync,
+  } = callbacks;
 
   // Fresh, atomic per-run VM state (zero leakage across runs)
   const functions = new Map<string, FunctionDecl[]>();
@@ -409,28 +421,61 @@ export async function runProgram(program: ProgramNode, callbacks: RunCallbacks):
   const enumConsts = new Map<string, number>();
   const blocks = new Map<number, MemoryBlock>();
   const virtualFs = new Map<string, Uint8Array>();
+  const virtualDirs = new Set<string>();
   const lastNotifiedFs = new Map<string, Uint8Array>();
   const cFileHandles = new Map<number, CFileHandle>();
   const staticVars = new Map<string, Cell>();
+
+  const registerParentDirs = (filePath: string): void => {
+    for (const dir of getParentFolderPaths(filePath)) {
+      virtualDirs.add(dir);
+    }
+  };
+
+  const isVirtualDir = (normPath: string): boolean => {
+    if (!normPath) return false;
+    return isDirectoryPath(normPath, virtualFs.keys(), virtualDirs);
+  };
+
+  const hasFileAncestorConflict = (filePath: string): boolean => {
+    for (const parent of getParentFolderPaths(filePath)) {
+      if (virtualFs.has(parent)) return true;
+    }
+    return false;
+  };
+
+  if (initialFolders) {
+    for (const rawFolder of initialFolders) {
+      const normFolder = normalizePath(rawFolder);
+      if (normFolder) {
+        virtualDirs.add(normFolder);
+        for (const parent of getParentFolderPaths(normFolder)) {
+          virtualDirs.add(parent);
+        }
+      }
+    }
+  }
 
   // Mount initial files from Virtual Workspace into binary-safe runtime VFS (Uint8Array)
   if (initialFiles) {
     if (initialFiles instanceof Map) {
       for (const [rawPath, content] of initialFiles.entries()) {
-        const norm = normalizeVirtualPath(rawPath);
+        const norm = normalizePath(rawPath);
         if (norm) {
           const bytes = toBytes(content);
           virtualFs.set(norm, bytes);
           lastNotifiedFs.set(norm, cloneBytes(bytes));
+          registerParentDirs(norm);
         }
       }
     } else {
       for (const [rawPath, content] of Object.entries(initialFiles)) {
-        const norm = normalizeVirtualPath(rawPath);
+        const norm = normalizePath(rawPath);
         if (norm) {
           const bytes = toBytes(content);
           virtualFs.set(norm, bytes);
           lastNotifiedFs.set(norm, cloneBytes(bytes));
+          registerParentDirs(norm);
         }
       }
     }
@@ -689,12 +734,12 @@ export async function runProgram(program: ProgramNode, callbacks: RunCallbacks):
   };
 
   const openFileStream = (stream: StreamVal, rawFilePath: string, modeBits?: number): void => {
-    const filePath = normalizeVirtualPath(rawFilePath);
+    const filePath = normalizePath(rawFilePath);
     stream.filePath = filePath;
     stream.buffer.clear();
     stream.lastReadCount = 0;
 
-    if (!filePath) {
+    if (!filePath || isVirtualDir(filePath) || hasFileAncestorConflict(filePath)) {
       stream.isOpen = false;
       stream.buffer.failbit = true;
       return;
@@ -769,6 +814,7 @@ export async function runProgram(program: ProgramNode, callbacks: RunCallbacks):
       }
 
       virtualFs.set(filePath, cloneBytes(nextBytes));
+      registerParentDirs(filePath);
       stream.isOpen = true;
       if (!existed) {
         notifyVfsChange(filePath, 'create', nextBytes);
@@ -840,6 +886,7 @@ export async function runProgram(program: ProgramNode, callbacks: RunCallbacks):
       }
     }
     virtualFs.set(filePath, cloneBytes(nextBytes));
+    registerParentDirs(filePath);
     stream.isOpen = true;
     if (!existed) {
       notifyVfsChange(filePath, 'create', nextBytes);
@@ -2256,9 +2303,9 @@ export async function runProgram(program: ProgramNode, callbacks: RunCallbacks):
     if (name === 'fopen') {
       const rawPath = args[0] ? readCStringFromVal(await evalExpr(args[0], scope)) : '';
       const rawMode = args[1] ? readCStringFromVal(await evalExpr(args[1], scope)) : '';
-      const filePath = normalizeVirtualPath(rawPath);
+      const filePath = normalizePath(rawPath);
       const parsed = parseFopenMode(rawMode);
-      if (!filePath || !parsed) {
+      if (!filePath || !parsed || isVirtualDir(filePath) || hasFileAncestorConflict(filePath)) {
         return { handled: true, value: NULL_PTR };
       }
       const existed = virtualFs.has(filePath);
@@ -2272,6 +2319,7 @@ export async function runProgram(program: ProgramNode, callbacks: RunCallbacks):
       if (parsed.canWrite && (parsed.truncate || !existed)) {
         const initialOut = getCFileBytes(handle);
         virtualFs.set(filePath, initialOut);
+        registerParentDirs(filePath);
         if (!existed) {
           notifyVfsChange(filePath, 'create', initialOut);
         } else if (prevBytes && !bytesEqual(prevBytes, initialOut)) {
@@ -2499,9 +2547,9 @@ export async function runProgram(program: ProgramNode, callbacks: RunCallbacks):
     // <cstdio> file management over Virtual FS
     if (name === 'remove') {
       const targetPath = args[0]
-        ? normalizeVirtualPath(readCStringFromVal(await evalExpr(args[0], scope)))
+        ? normalizePath(readCStringFromVal(await evalExpr(args[0], scope)))
         : '';
-      if (targetPath && virtualFs.has(targetPath)) {
+      if (targetPath && !isVirtualDir(targetPath) && virtualFs.has(targetPath)) {
         virtualFs.delete(targetPath);
         notifyVfsChange(targetPath, 'delete');
         return { handled: true, value: 0 };
@@ -2511,15 +2559,23 @@ export async function runProgram(program: ProgramNode, callbacks: RunCallbacks):
 
     if (name === 'rename') {
       const oldPath = args[0]
-        ? normalizeVirtualPath(readCStringFromVal(await evalExpr(args[0], scope)))
+        ? normalizePath(readCStringFromVal(await evalExpr(args[0], scope)))
         : '';
       const newPath = args[1]
-        ? normalizeVirtualPath(readCStringFromVal(await evalExpr(args[1], scope)))
+        ? normalizePath(readCStringFromVal(await evalExpr(args[1], scope)))
         : '';
-      if (oldPath && newPath && virtualFs.has(oldPath)) {
+      if (
+        oldPath &&
+        newPath &&
+        !isVirtualDir(oldPath) &&
+        !isVirtualDir(newPath) &&
+        !hasFileAncestorConflict(newPath) &&
+        virtualFs.has(oldPath)
+      ) {
         const rawBytes = virtualFs.get(oldPath)!;
         virtualFs.delete(oldPath);
         virtualFs.set(newPath, rawBytes);
+        registerParentDirs(newPath);
         notifyVfsChange(oldPath, 'delete');
         notifyVfsChange(newPath, 'create', rawBytes);
         return { handled: true, value: 0 };

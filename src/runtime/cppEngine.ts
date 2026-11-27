@@ -18,6 +18,7 @@ export interface BrowserSessionCallbacks {
   onStderr: (text: string) => void;
   onWaitingForInput?: () => void;
   initialFiles?: Record<string, string | Uint8Array> | Map<string, string | Uint8Array>;
+  initialFolders?: Iterable<string>;
   onVfsChange?: (event: VfsRuntimeChangeEvent) => void;
   onVfsFinalSync?: (snapshot: Record<string, Uint8Array>) => void;
   onExit: (result: { code: number | null; durationMs: number; reason?: string }) => void;
@@ -133,6 +134,7 @@ export class BrowserCppSession {
       stdin: this.stdin,
       signal: this.controller.signal,
       initialFiles: callbacks.initialFiles,
+      initialFolders: callbacks.initialFolders,
       onVfsChange: callbacks.onVfsChange,
       onVfsFinalSync: callbacks.onVfsFinalSync,
     })

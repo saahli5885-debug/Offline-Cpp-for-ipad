@@ -23,12 +23,13 @@ export interface DiagnosticSummary {
   notes: number;
 }
 
-export type ConsoleChunkKind = 'stdout' | 'stderr' | 'stdin' | 'system' | 'error';
+export type ConsoleChunkKind = 'stdout' | 'stderr' | 'stdin' | 'system' | 'error' | 'hexdump';
 
 export interface ConsoleChunk {
   id: string;
   kind: ConsoleChunkKind;
   text: string;
+  hexDump?: import('../vfs/types').HexDumpPayload;
 }
 
 export type RunStatus = 'idle' | 'compiling' | 'running' | 'completed' | 'compile_error' | 'stopped' | 'error';

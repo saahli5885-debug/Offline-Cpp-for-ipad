@@ -66,8 +66,9 @@ export function createZipArchive(entries: ZipEntryInput[]): Uint8Array {
   let offset = 0;
 
   for (const entry of entries) {
+    const isDir = entry.name.endsWith('/');
     const nameBytes = encoder.encode(entry.name);
-    const dataBytes = encodeEntryContent(entry);
+    const dataBytes = isDir ? new Uint8Array(0) : encodeEntryContent(entry);
     const crc = computeCrc32(dataBytes);
     const { dosTime, dosDate } = toDosTimeAndDate(entry.updatedAt ?? Date.now());
     const utf8Flag = 0x0800;
@@ -108,7 +109,7 @@ export function createZipArchive(entries: ZipEntryInput[]): Uint8Array {
     cv.setUint16(32, 0, true); // File comment length
     cv.setUint16(34, 0, true); // Disk number start
     cv.setUint16(36, 0, true); // Internal file attributes
-    cv.setUint32(38, 0, true); // External file attributes
+    cv.setUint32(38, isDir ? 0x10 : 0, true); // External file attributes (0x10 = DOS directory)
     cv.setUint32(42, offset, true); // Relative offset of local header
     centralHeader.set(nameBytes, 46);
 
