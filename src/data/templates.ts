@@ -105,11 +105,142 @@ int main() {
 `,
   },
   {
+    id: 'cpp-fstream',
+    language: 'cpp',
+    title: 'Файлы: ifstream / ofstream',
+    description: 'Чтение из input.txt и запись результата в output.txt в рабочей области',
+    code: `#include <fstream>
+#include <iostream>
+#include <string>
+using namespace std;
+
+int main() {
+    ifstream in("input.txt");
+    if (!in.is_open()) {
+        cout << "Файл input.txt не найден. Создайте его в панели «Файлы».\\n";
+        return 1;
+    }
+
+    ofstream out("output.txt");
+    if (!out.is_open()) {
+        cout << "Не удалось открыть output.txt для записи.\\n";
+        return 1;
+    }
+
+    int sum = 0;
+    int value = 0;
+    int count = 0;
+    while (in >> value) {
+        sum += value;
+        count++;
+    }
+
+    in.clear();
+    string note;
+    getline(in >> ws, note);
+
+    out << "Количество чисел: " << count << "\\n";
+    out << "Сумма: " << sum << "\\n";
+    if (!note.empty()) {
+        out << "Комментарий: " << note << "\\n";
+    }
+    out.close();
+
+    cout << "Готово! Обработано чисел: " << count << ", сумма: " << sum << "\\n";
+    cout << "Откройте output.txt в панели «Файлы», чтобы увидеть результат.\\n";
+    return 0;
+}
+`,
+  },
+  {
+    id: 'cpp-binary-fstream',
+    language: 'cpp',
+    title: 'Бинарные файлы (ios::binary)',
+    description: 'Запись и чтение структур struct через ofstream::write и ifstream::read',
+    code: `#include <fstream>
+#include <iostream>
+#include <cstring>
+using namespace std;
+
+struct Record {
+    int id;
+    double score;
+    char name[12];
+};
+
+int main() {
+    Record outItems[2] = {
+        {101, 98.5, "Alice"},
+        {102, 87.25, "Bob"}
+    };
+
+    ofstream out("records.bin", ios::out | ios::binary);
+    out.write(reinterpret_cast<char*>(outItems), sizeof(outItems));
+    out.close();
+
+    ifstream in("records.bin", ios::in | ios::binary);
+    Record item;
+    cout << "sizeof(Record) = " << sizeof(Record) << " Б\\n";
+    while (in.read(reinterpret_cast<char*>(&item), sizeof(Record))) {
+        cout << "#" << item.id << " " << item.name << " -> " << item.score << "\\n";
+    }
+    in.close();
+    return 0;
+}
+`,
+  },
+  {
     id: 'c-sum',
     language: 'c',
     title: 'Ввод и вывод (scanf / printf)',
     description: 'Базовый интерактивный пример на чистом C',
     code: DEFAULT_CODE.c,
+  },
+  {
+    id: 'c-binary-stdio',
+    language: 'c',
+    title: 'Файлы на C (FILE* / fwrite / fread)',
+    description: 'Бинарная запись и чтение структур через fopen, fwrite, fseek и fread',
+    code: `#include <stdio.h>
+
+struct Item {
+    int id;
+    double price;
+    char label[12];
+};
+
+int main(void) {
+    struct Item stock[2] = {
+        {1, 19.99, "Notebook"},
+        {2, 4.50, "Pencil"}
+    };
+
+    FILE* f = fopen("stock.bin", "wb");
+    if (f == NULL) {
+        printf("Не удалось открыть файл для записи.\\n");
+        return 1;
+    }
+    size_t written = fwrite(stock, sizeof(struct Item), 2, f);
+    fclose(f);
+    printf("Записано записей: %zu (sizeof = %zu Б)\\n", written, sizeof(struct Item));
+
+    FILE* rf = fopen("stock.bin", "rb");
+    if (!rf) return 1;
+    fseek(rf, 0, SEEK_END);
+    long fileSize = ftell(rf);
+    rewind(rf);
+
+    struct Item loaded[2];
+    size_t count = fread(loaded, sizeof(struct Item), 2, rf);
+    fclose(rf);
+
+    printf("Размер файла: %ld Б, прочитано: %zu\\n", fileSize, count);
+    for (size_t i = 0; i < count; ++i) {
+        printf("  [%d] %s — %.2f\\n", loaded[i].id, loaded[i].label, loaded[i].price);
+    }
+    return 0;
+}
+`,
   },
   {
     id: 'c-stats',

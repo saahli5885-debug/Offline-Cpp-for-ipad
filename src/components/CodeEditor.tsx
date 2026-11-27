@@ -37,6 +37,8 @@ interface CodeEditorProps {
   theme: AppTheme;
   fontSize: number;
   lineWrapping: boolean;
+  syntaxMode?: 'cpp' | 'plain';
+  readOnly?: boolean;
   diagnostics: CompilerDiagnostic[];
   onRun: () => void;
   onFormat: () => void;
@@ -157,17 +159,32 @@ function createEditorTheme(theme: AppTheme, fontSize: number) {
 }
 
 export const CodeEditor = forwardRef<CodeEditorHandle, CodeEditorProps>(function CodeEditor(
-  { value, onChange, theme, fontSize, lineWrapping, diagnostics, onRun, onFormat, onWidthChange },
+  {
+    value,
+    onChange,
+    theme,
+    fontSize,
+    lineWrapping,
+    syntaxMode = 'cpp',
+    readOnly = false,
+    diagnostics,
+    onRun,
+    onFormat,
+    onWidthChange,
+  },
   ref
 ) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const viewRef = useRef<EditorView | null>(null);
   const themeCompartmentRef = useRef(new Compartment());
   const wrapCompartmentRef = useRef(new Compartment());
+  const langCompartmentRef = useRef(new Compartment());
+  const readOnlyCompartmentRef = useRef(new Compartment());
   const onChangeRef = useRef(onChange);
   const onRunRef = useRef(onRun);
   const onFormatRef = useRef(onFormat);
   const onWidthChangeRef = useRef(onWidthChange);
+  const isExternalSyncRef = useRef(false);
 
   onChangeRef.current = onChange;
   onRunRef.current = onRun;
@@ -202,6 +219,8 @@ export const CodeEditor = forwardRef<CodeEditorHandle, CodeEditorProps>(function
 
     const themeCompartment = themeCompartmentRef.current;
     const wrapCompartment = wrapCompartmentRef.current;
+    const langCompartment = langCompartmentRef.current;
+    const readOnlyCompartment = readOnlyCompartmentRef.current;
 
     const state = EditorState.create({
       doc: value,
@@ -211,13 +230,16 @@ export const CodeEditor = forwardRef<CodeEditorHandle, CodeEditorProps>(function
         highlightActiveLine(),
         history(),
         drawSelection(),
-        indentOnInput(),
         indentUnit.of('    '),
         EditorState.tabSize.of(4),
         bracketMatching(),
-        closeBrackets(),
         highlightSelectionMatches(),
-        cpp(),
+        langCompartment.of(
+          syntaxMode === 'cpp' ? [cpp(), indentOnInput(), closeBrackets()] : []
+        ),
+        readOnlyCompartment.of(
+          readOnly ? [EditorState.readOnly.of(true), EditorView.editable.of(false)] : []
+        ),
         diagnosticLinesField,
         EditorView.contentAttributes.of({
           'aria-label': 'Редактор кода C++ и C',
@@ -256,7 +278,7 @@ export const CodeEditor = forwardRef<CodeEditorHandle, CodeEditorProps>(function
           indentWithTab,
         ]),
         EditorView.updateListener.of((update) => {
-          if (update.docChanged) {
+          if (update.docChanged && !isExternalSyncRef.current) {
             onChangeRef.current(update.state.doc.toString());
           }
         }),
@@ -293,9 +315,14 @@ export const CodeEditor = forwardRef<CodeEditorHandle, CodeEditorProps>(function
     if (!view) return;
     const current = view.state.doc.toString();
     if (current !== value) {
-      view.dispatch({
-        changes: { from: 0, to: current.length, insert: value },
-      });
+      isExternalSyncRef.current = true;
+      try {
+        view.dispatch({
+          changes: { from: 0, to: current.length, insert: value },
+        });
+      } finally {
+        isExternalSyncRef.current = false;
+      }
     }
   }, [value]);
 
@@ -324,6 +351,30 @@ export const CodeEditor = forwardRef<CodeEditorHandle, CodeEditorProps>(function
     view.requestMeasure();
   }, [lineWrapping]);
 
+  // Sync language syntax mode (C/C++/headers vs plain text/data files)
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    view.dispatch({
+      effects: langCompartmentRef.current.reconfigure(
+        syntaxMode === 'cpp' ? [cpp(), indentOnInput(), closeBrackets()] : []
+      ),
+    });
+    view.requestMeasure();
+  }, [syntaxMode]);
+
+  // Sync read-only state (e.g. hex preview for binary files)
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    view.dispatch({
+      effects: readOnlyCompartmentRef.current.reconfigure(
+        readOnly ? [EditorState.readOnly.of(true), EditorView.editable.of(false)] : []
+      ),
+    });
+    view.requestMeasure();
+  }, [readOnly]);
+
   // Sync error/warning line highlights
   useEffect(() => {
     const view = viewRef.current;
@@ -338,6 +389,8 @@ export const CodeEditor = forwardRef<CodeEditorHandle, CodeEditorProps>(function
       ref={containerRef}
       data-testid="code-editor"
       data-wrap={lineWrapping ? 'on' : 'off'}
+      data-syntax={syntaxMode}
+      data-readonly={readOnly ? 'true' : 'false'}
       className="h-full w-full min-w-0 max-w-full box-border overflow-hidden bg-[var(--app-bg)]"
     />
   );

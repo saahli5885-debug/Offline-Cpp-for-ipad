@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlignLeft,
   AlertCircle,
+  ArrowLeft,
   Check,
   CloudCheck,
   CloudOff,
@@ -13,6 +14,7 @@ import { ConsolePanel, type ConsolePanelHandle } from './components/ConsolePanel
 import { OfflineIndicator } from './components/OfflineIndicator';
 import { ShortcutsModal } from './components/ShortcutsModal';
 import { TopBar } from './components/TopBar';
+import { WorkspaceSidebar } from './components/WorkspaceSidebar';
 import { CODE_TEMPLATES, DEFAULT_CODE } from './data/templates';
 import { useOnlineStatus, useServiceWorkerStatus } from './hooks/usePWA';
 import { BrowserCppSession, compileInBrowser } from './runtime/cppEngine';
@@ -48,6 +50,27 @@ import {
   resolveWordWrap,
   type WordWrapPreference,
 } from './utils/layout';
+import {
+  applyVfsDeltaToIdb,
+  deleteFileFromIdb,
+  loadAllFilesFromIdb,
+  putFilesBatchToIdb,
+  putFileToIdb,
+  renameFileInIdb,
+} from './vfs/idbStorage';
+import type { VfsChangeKind, VirtualFile } from './vfs/types';
+import {
+  cloneBytes,
+  computeVfsDelta,
+  createVirtualFile,
+  detectLanguageFromFileName,
+  isBinaryFileName,
+  isCppSyntaxFile,
+  normalizeVirtualPath,
+  sortVirtualFiles,
+  validateFileName,
+} from './vfs/vfsHelpers';
+import { exportSingleFileToDevice, exportWorkspaceZipToDevice } from './vfs/zipExport';
 
 const STORAGE_KEYS = {
   language: 'cppstudio.language',
@@ -62,7 +85,43 @@ const STORAGE_KEYS = {
   splitRatio: 'cppstudio.splitRatio',
   autosave: 'cppstudio.autosave',
   lastSavedAt: 'cppstudio.lastSavedAt',
+  activeFile: 'cppstudio.activeFile',
+  sidebarOpen: 'cppstudio.sidebarOpen',
 };
+
+const DEFAULT_INPUT_TXT = '10 20 30\nПривет из виртуальной рабочей области!\n';
+
+function createInitialFilesMap(): Record<string, VirtualFile> {
+  const now = Date.now();
+  const cppCode = safeReadStorage(STORAGE_KEYS.codeCpp, DEFAULT_CODE.cpp);
+  const cCode = safeReadStorage(STORAGE_KEYS.codeC, DEFAULT_CODE.c);
+  return {
+    'main.cpp': createVirtualFile('main.cpp', cppCode, now),
+    'main.c': createVirtualFile('main.c', cCode, now),
+    'input.txt': createVirtualFile('input.txt', DEFAULT_INPUT_TXT, now),
+  };
+}
+
+function filesMapToRecord(map: Record<string, VirtualFile>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [name, file] of Object.entries(map)) {
+    out[name] = file.content;
+  }
+  return out;
+}
+
+function filesMapToBytesRecord(map: Record<string, VirtualFile>): Record<string, Uint8Array> {
+  const out: Record<string, Uint8Array> = {};
+  for (const [name, file] of Object.entries(map)) {
+    out[name] = cloneBytes(file.bytes);
+  }
+  return out;
+}
+
+async function readBrowserFileBytes(file: File): Promise<Uint8Array> {
+  const buffer = await file.arrayBuffer();
+  return new Uint8Array(buffer);
+}
 
 export default function App() {
   const [language, setLanguage] = useState<Language>(() => {
@@ -75,10 +134,27 @@ export default function App() {
     c: safeReadStorage(STORAGE_KEYS.standardC, 'c17') as CompilerStandard,
   }));
 
-  const [codes, setCodes] = useState<Record<Language, string>>(() => ({
-    cpp: safeReadStorage(STORAGE_KEYS.codeCpp, DEFAULT_CODE.cpp),
-    c: safeReadStorage(STORAGE_KEYS.codeC, DEFAULT_CODE.c),
-  }));
+  const [filesMap, setFilesMap] = useState<Record<string, VirtualFile>>(() =>
+    createInitialFilesMap()
+  );
+
+  const [activeFileName, setActiveFileName] = useState<string>(() => {
+    const savedLang = safeReadStorage(STORAGE_KEYS.language, 'cpp') === 'c' ? 'c' : 'cpp';
+    const fallback = savedLang === 'c' ? 'main.c' : 'main.cpp';
+    const savedActive = normalizeVirtualPath(safeReadStorage(STORAGE_KEYS.activeFile, fallback));
+    return savedActive || fallback;
+  });
+
+  const [sidebarOpen, setSidebarOpen] = useState<boolean>(() => {
+    const saved = safeReadStorage(STORAGE_KEYS.sidebarOpen, '');
+    if (saved === 'true') return true;
+    if (saved === 'false') return false;
+    return typeof window !== 'undefined' ? window.innerWidth >= 1024 : true;
+  });
+
+  const [recentVfsChanges, setRecentVfsChanges] = useState<Record<string, VfsChangeKind>>({});
+  const [storageError, setStorageError] = useState<string | null>(null);
+  const [vfsStatusMessage, setVfsStatusMessage] = useState<string | null>(null);
 
   const [themeId, setThemeId] = useState<ThemeId>(() =>
     normalizeThemeId(safeReadStorage(STORAGE_KEYS.theme, 'github-dark'))
@@ -152,19 +228,24 @@ export default function App() {
   const [exitCode, setExitCode] = useState<number | null>(null);
   const [exitReason, setExitReason] = useState<string | null>(null);
 
-  const codesRef = useRef(codes);
-  codesRef.current = codes;
+  const filesRef = useRef(filesMap);
+  filesRef.current = filesMap;
+  const activeFileRef = useRef(activeFileName);
+  activeFileRef.current = activeFileName;
   const autosaveEnabledRef = useRef(autosaveEnabled);
   autosaveEnabledRef.current = autosaveEnabled;
+  const userEditedBeforeHydrationRef = useRef(false);
   const sessionRef = useRef<BrowserCppSession | null>(null);
   const chunkCounterRef = useRef(0);
   const formatTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const autosaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const vfsToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const editorRef = useRef<CodeEditorHandle | null>(null);
   const consoleRef = useRef<ConsolePanelHandle | null>(null);
   const workspaceRef = useRef<HTMLDivElement | null>(null);
   const draggingRef = useRef(false);
 
+  const primaryEntryFile = language === 'cpp' ? 'main.cpp' : 'main.c';
   const activeTheme = useMemo(() => getThemeById(themeId), [themeId]);
 
   const effectiveLayout = useMemo(
@@ -177,37 +258,84 @@ export default function App() {
     [wordWrapPreference, viewport.width, editorWidth]
   );
 
-  const currentCode = codes[language];
+  const sortedFiles = useMemo(
+    () => sortVirtualFiles(Object.values(filesMap), primaryEntryFile),
+    [filesMap, primaryEntryFile]
+  );
+
+  const currentFile = filesMap[activeFileName] ?? filesMap[primaryEntryFile];
+  const currentContent = currentFile?.content ?? '';
   const currentStandard = standards[language];
+  const currentSyntaxMode: 'cpp' | 'plain' = isCppSyntaxFile(activeFileName) ? 'cpp' : 'plain';
+  const visibleEditorDiagnostics = useMemo(
+    () => diagnostics.filter((d) => !d.file || d.file === activeFileName),
+    [diagnostics, activeFileName]
+  );
   const diagSummary = useMemo(() => summarizeDiagnostics(diagnostics), [diagnostics]);
   const autosaveStatus = useMemo(
     () => getAutosaveStatusText(autosaveState, lastSavedAt),
     [autosaveState, lastSavedAt]
   );
+  const recentChangeCount = useMemo(
+    () => Object.keys(recentVfsChanges).length,
+    [recentVfsChanges]
+  );
 
-  const getLiveCode = useCallback((): string => {
+  const showVfsStatus = useCallback((message: string) => {
+    setVfsStatusMessage(message);
+    if (vfsToastTimerRef.current) clearTimeout(vfsToastTimerRef.current);
+    vfsToastTimerRef.current = setTimeout(() => {
+      setVfsStatusMessage(null);
+    }, 3200);
+  }, []);
+
+  const reportStorageError = useCallback((context: string, err: unknown) => {
+    const detail = err instanceof Error ? err.message : String(err);
+    setStorageError(`${context}: ${detail}`);
+    setAutosaveState('error');
+  }, []);
+
+  const getLiveActiveContent = useCallback((): string => {
     const editorText = editorRef.current?.getValue();
-    return editorText !== undefined ? editorText : codesRef.current[language];
-  }, [language]);
+    if (editorText !== undefined) return editorText;
+    return filesRef.current[activeFileRef.current]?.content ?? '';
+  }, []);
 
-  const flushCodeToStorage = useCallback(
-    (targetCodes: Record<Language, string> = codesRef.current) => {
+  const syncEntryLocalStorage = useCallback((map: Record<string, VirtualFile>, now = Date.now()) => {
+    const cppFile = map['main.cpp'];
+    const cFile = map['main.c'];
+    const cppRes = cppFile
+      ? safeWriteStorage(STORAGE_KEYS.codeCpp, cppFile.content, undefined, now)
+      : { ok: true };
+    const cRes = cFile
+      ? safeWriteStorage(STORAGE_KEYS.codeC, cFile.content, undefined, now)
+      : { ok: true };
+    return cppRes.ok && cRes.ok;
+  }, []);
+
+  const persistFile = useCallback(
+    async (file: VirtualFile, allFiles: Record<string, VirtualFile> = filesRef.current) => {
       const now = Date.now();
-      const cppRes = safeWriteStorage(STORAGE_KEYS.codeCpp, targetCodes.cpp, undefined, now);
-      const cRes = safeWriteStorage(STORAGE_KEYS.codeC, targetCodes.c, undefined, now);
-      if (cppRes.ok && cRes.ok) {
-        safeWriteStorage(STORAGE_KEYS.lastSavedAt, String(now), undefined, now);
-        setLastSavedAt(now);
-        setAutosaveState('saved');
-      } else {
-        setAutosaveState('error');
+      const localOk = syncEntryLocalStorage(allFiles, now);
+      try {
+        await putFileToIdb(file);
+        setStorageError(null);
+        if (localOk) {
+          safeWriteStorage(STORAGE_KEYS.lastSavedAt, String(now), undefined, now);
+          setLastSavedAt(now);
+          setAutosaveState(autosaveEnabledRef.current ? 'saved' : 'disabled');
+        } else {
+          setAutosaveState('error');
+        }
+      } catch (err) {
+        reportStorageError(`Не удалось сохранить «${file.name}» в IndexedDB`, err);
       }
     },
-    []
+    [reportStorageError, syncEntryLocalStorage]
   );
 
   const scheduleAutosave = useCallback(
-    (nextCodes: Record<Language, string>) => {
+    (file: VirtualFile, nextMap: Record<string, VirtualFile>) => {
       if (!autosaveEnabledRef.current) {
         setAutosaveState('disabled');
         return;
@@ -217,11 +345,69 @@ export default function App() {
         clearTimeout(autosaveTimerRef.current);
       }
       autosaveTimerRef.current = setTimeout(() => {
-        flushCodeToStorage(nextCodes);
+        void persistFile(file, nextMap);
       }, 400);
     },
-    [flushCodeToStorage]
+    [persistFile]
   );
+
+  // Hydrate persistent Virtual Workspace from IndexedDB on startup
+  useEffect(() => {
+    let cancelled = false;
+
+    void (async () => {
+      try {
+        const storedFiles = await loadAllFilesFromIdb();
+        if (cancelled) return;
+
+        if (storedFiles.length === 0) {
+          // First visit: seed IndexedDB with default main.cpp, main.c, and sample input.txt
+          await putFilesBatchToIdb(Object.values(filesRef.current));
+          return;
+        }
+
+        const nextMap: Record<string, VirtualFile> = {};
+        for (const f of storedFiles) {
+          nextMap[f.name] = f;
+        }
+        // Ensure entry source files always exist
+        if (!nextMap['main.cpp']) {
+          nextMap['main.cpp'] = filesRef.current['main.cpp'] ?? createVirtualFile('main.cpp', DEFAULT_CODE.cpp);
+        }
+        if (!nextMap['main.c']) {
+          nextMap['main.c'] = filesRef.current['main.c'] ?? createVirtualFile('main.c', DEFAULT_CODE.c);
+        }
+
+        // Preserve any immediate keystroke made before IDB finished loading
+        if (userEditedBeforeHydrationRef.current) {
+          const active = activeFileRef.current;
+          if (filesRef.current[active]) {
+            nextMap[active] = filesRef.current[active];
+          }
+        }
+
+        filesRef.current = nextMap;
+        setFilesMap(nextMap);
+        syncEntryLocalStorage(nextMap);
+
+        if (!nextMap[activeFileRef.current]) {
+          const fallback = language === 'c' ? 'main.c' : 'main.cpp';
+          activeFileRef.current = fallback;
+          setActiveFileName(fallback);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          reportStorageError('Ошибка загрузки виртуальной ФС (IndexedDB)', err);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+    // Run once on initial mount
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const handleToggleAutosave = useCallback(() => {
     setAutosaveEnabled((prev) => {
@@ -229,17 +415,25 @@ export default function App() {
       autosaveEnabledRef.current = next;
       safeWriteStorage(STORAGE_KEYS.autosave, String(next));
       if (next) {
-        const liveCode = getLiveCode();
-        const synced = { ...codesRef.current, [language]: liveCode };
-        codesRef.current = synced;
-        flushCodeToStorage(synced);
+        const active = activeFileRef.current;
+        const existing = filesRef.current[active];
+        if (existing?.isBinary) {
+          void persistFile(existing, filesRef.current);
+        } else {
+          const liveContent = getLiveActiveContent();
+          const updatedFile = createVirtualFile(active, liveContent);
+          const nextMap = { ...filesRef.current, [active]: updatedFile };
+          filesRef.current = nextMap;
+          setFilesMap(nextMap);
+          void persistFile(updatedFile, nextMap);
+        }
       } else {
         if (autosaveTimerRef.current) clearTimeout(autosaveTimerRef.current);
         setAutosaveState('disabled');
       }
       return next;
     });
-  }, [flushCodeToStorage, getLiveCode, language]);
+  }, [getLiveActiveContent, persistFile]);
 
   const appendChunk = useCallback((kind: ConsoleChunk['kind'], text: string) => {
     chunkCounterRef.current += 1;
@@ -257,6 +451,14 @@ export default function App() {
   useEffect(() => {
     safeWriteStorage(STORAGE_KEYS.language, language);
   }, [language]);
+
+  useEffect(() => {
+    safeWriteStorage(STORAGE_KEYS.activeFile, activeFileName);
+  }, [activeFileName]);
+
+  useEffect(() => {
+    safeWriteStorage(STORAGE_KEYS.sidebarOpen, String(sidebarOpen));
+  }, [sidebarOpen]);
 
   useEffect(() => {
     safeWriteStorage(STORAGE_KEYS.standardCpp, standards.cpp);
@@ -279,18 +481,28 @@ export default function App() {
     safeWriteStorage(STORAGE_KEYS.splitRatio, splitRatio.toFixed(4));
   }, [splitRatio]);
 
-  // Immediately flush code when page is hidden/unloaded (vital for iPad Safari / PWA suspension)
+  // Immediately flush active file when page is hidden/unloaded (vital for iPad Safari / PWA suspension)
   useEffect(() => {
     const flushIfEnabled = () => {
       if (!autosaveEnabledRef.current) return;
+      const active = activeFileRef.current;
+      const existing = filesRef.current[active];
       const live = editorRef.current?.getValue();
-      const snapshot =
-        live !== undefined ? { ...codesRef.current, [language]: live } : codesRef.current;
-      codesRef.current = snapshot;
+      const updatedFile = existing?.isBinary
+        ? existing
+        : live !== undefined
+          ? createVirtualFile(active, live)
+          : existing;
+      if (!updatedFile) return;
+
+      const snapshot = { ...filesRef.current, [active]: updatedFile };
+      filesRef.current = snapshot;
       const now = Date.now();
-      safeWriteStorage(STORAGE_KEYS.codeCpp, snapshot.cpp, undefined, now);
-      safeWriteStorage(STORAGE_KEYS.codeC, snapshot.c, undefined, now);
+      syncEntryLocalStorage(snapshot, now);
       safeWriteStorage(STORAGE_KEYS.lastSavedAt, String(now), undefined, now);
+      void putFileToIdb(updatedFile).catch((err) => {
+        reportStorageError(`Не удалось сохранить «${updatedFile.name}» при закрытии`, err);
+      });
     };
 
     const onVisibilityChange = () => {
@@ -307,7 +519,7 @@ export default function App() {
       window.removeEventListener('beforeunload', flushIfEnabled);
       document.removeEventListener('visibilitychange', onVisibilityChange);
     };
-  }, [language]);
+  }, [reportStorageError, syncEntryLocalStorage]);
 
   // Track viewport resize (iPad Split View transitions & external Full HD monitor attach/detach)
   useEffect(() => {
@@ -333,19 +545,35 @@ export default function App() {
     appendChunk('system', 'Программа остановлена пользователем.');
   }, [appendChunk, stopActiveSession]);
 
+  const flushActiveEditorBuffer = useCallback((): Record<string, VirtualFile> => {
+    const active = activeFileRef.current;
+    const existing = filesRef.current[active];
+    if (existing?.isBinary) {
+      return filesRef.current;
+    }
+    const live = getLiveActiveContent();
+    if (!existing || existing.content !== live) {
+      const updatedFile = createVirtualFile(active, live);
+      const nextMap = { ...filesRef.current, [active]: updatedFile };
+      filesRef.current = nextMap;
+      setFilesMap(nextMap);
+      if (autosaveEnabledRef.current) {
+        void persistFile(updatedFile, nextMap);
+      }
+      return nextMap;
+    }
+    return filesRef.current;
+  }, [getLiveActiveContent, persistFile]);
+
   const handleRun = useCallback(() => {
     stopActiveSession();
 
-    // Synchronously read live editor buffer to eliminate stale-closure races on Cmd+Enter / Run
-    const liveCode = getLiveCode();
-    if (codesRef.current[language] !== liveCode) {
-      const nextCodes = { ...codesRef.current, [language]: liveCode };
-      codesRef.current = nextCodes;
-      setCodes(nextCodes);
-      if (autosaveEnabledRef.current) {
-        flushCodeToStorage(nextCodes);
-      }
-    }
+    // Synchronously flush live CodeMirror edits into Virtual Workspace before mounting VFS
+    const latestFilesMap = flushActiveEditorBuffer();
+    const entryName = language === 'cpp' ? 'main.cpp' : 'main.c';
+    const entryCode = latestFilesMap[entryName]?.content ?? '';
+    const vfsTextRecord = filesMapToRecord(latestFilesMap);
+    const vfsBytesRecord = filesMapToBytesRecord(latestFilesMap);
 
     setRunId((id) => id + 1);
     setStatus('compiling');
@@ -356,12 +584,13 @@ export default function App() {
     setRunDurationMs(null);
     setExitCode(null);
     setExitReason(null);
+    setRecentVfsChanges({});
 
     if (effectiveLayout === 'tabs') {
       setActiveTab('console');
     }
 
-    const compiled = compileInBrowser(liveCode, language);
+    const compiled = compileInBrowser(entryCode, language, vfsTextRecord, entryName);
     setCompileTimeMs(compiled.compileTimeMs);
     setDiagnostics(compiled.diagnostics);
     setRawCompilerOutput(compiled.rawCompilerOutput);
@@ -373,8 +602,91 @@ export default function App() {
 
     setStatus('running');
 
+    const beforeRunMap = new Map<string, Uint8Array>(Object.entries(vfsBytesRecord));
+    let lastSyncedMap = new Map<string, Uint8Array>(beforeRunMap);
+    const runChangeBadges: Record<string, VfsChangeKind> = {};
+    let finalSynced = false;
+
+    const applyRuntimeVfsSnapshot = (
+      snapshotObj: Record<string, Uint8Array>,
+      isFinal: boolean
+    ) => {
+      if (isFinal && finalSynced) return;
+      if (isFinal) finalSynced = true;
+
+      const afterMap = new Map<string, Uint8Array>();
+      for (const [path, bytes] of Object.entries(snapshotObj)) {
+        afterMap.set(path, cloneBytes(bytes));
+      }
+      const stepDelta = computeVfsDelta(lastSyncedMap, afterMap);
+      lastSyncedMap = afterMap;
+
+      const hasStepChanges =
+        stepDelta.created.length > 0 ||
+        stepDelta.modified.length > 0 ||
+        stepDelta.deleted.length > 0;
+
+      if (hasStepChanges) {
+        const now = Date.now();
+        const nextMap: Record<string, VirtualFile> = { ...filesRef.current };
+        const upserts: VirtualFile[] = [];
+
+        for (const createdPath of stepDelta.created) {
+          const vf = createVirtualFile(createdPath, afterMap.get(createdPath) ?? new Uint8Array(0), now);
+          nextMap[createdPath] = vf;
+          upserts.push(vf);
+          runChangeBadges[createdPath] = 'created';
+        }
+        for (const modifiedPath of stepDelta.modified) {
+          const vf = createVirtualFile(modifiedPath, afterMap.get(modifiedPath) ?? new Uint8Array(0), now);
+          nextMap[modifiedPath] = vf;
+          upserts.push(vf);
+          if (runChangeBadges[modifiedPath] !== 'created') {
+            runChangeBadges[modifiedPath] = 'modified';
+          }
+        }
+        for (const deletedPath of stepDelta.deleted) {
+          delete nextMap[deletedPath];
+          delete runChangeBadges[deletedPath];
+        }
+
+        filesRef.current = nextMap;
+        setFilesMap(nextMap);
+        setRecentVfsChanges({ ...runChangeBadges });
+        syncEntryLocalStorage(nextMap, now);
+
+        if (!nextMap[activeFileRef.current]) {
+          activeFileRef.current = entryName;
+          setActiveFileName(entryName);
+        }
+
+        void applyVfsDeltaToIdb(upserts, stepDelta.deleted)
+          .then(() => {
+            setStorageError(null);
+            safeWriteStorage(STORAGE_KEYS.lastSavedAt, String(now), undefined, now);
+            setLastSavedAt(now);
+          })
+          .catch((err) => {
+            reportStorageError('Ошибка синхронизации файлов после выполнения C++', err);
+          });
+      }
+
+      if (isFinal) {
+        const totalDelta = computeVfsDelta(beforeRunMap, afterMap);
+        const summaryParts: string[] = [
+          ...totalDelta.created.map((p) => `+${p}`),
+          ...totalDelta.modified.map((p) => `~${p}`),
+          ...totalDelta.deleted.map((p) => `-${p}`),
+        ];
+        if (summaryParts.length > 0) {
+          appendChunk('system', `Файлы рабочей области: ${summaryParts.join(', ')}`);
+        }
+      }
+    };
+
     let session: BrowserCppSession | null = null;
     session = new BrowserCppSession(compiled.program, {
+      initialFiles: vfsBytesRecord,
       onStdout: (data) => {
         if (sessionRef.current !== session) return;
         appendChunk('stdout', data);
@@ -388,6 +700,13 @@ export default function App() {
         setTimeout(() => {
           consoleRef.current?.focusInput();
         }, 0);
+      },
+      onVfsChange: (event) => {
+        if (sessionRef.current !== session) return;
+        applyRuntimeVfsSnapshot(event.snapshot, false);
+      },
+      onVfsFinalSync: (snapshot) => {
+        applyRuntimeVfsSnapshot(snapshot, true);
       },
       onExit: (msg) => {
         if (sessionRef.current !== session) return;
@@ -407,17 +726,29 @@ export default function App() {
       },
     });
     sessionRef.current = session;
-  }, [appendChunk, effectiveLayout, flushCodeToStorage, getLiveCode, language, stopActiveSession]);
+  }, [
+    appendChunk,
+    effectiveLayout,
+    flushActiveEditorBuffer,
+    language,
+    reportStorageError,
+    stopActiveSession,
+    syncEntryLocalStorage,
+  ]);
 
   const handleFormatCode = useCallback(() => {
-    const liveCode = getLiveCode();
+    const active = activeFileRef.current;
+    if (!isCppSyntaxFile(active)) return;
+
+    const liveCode = getLiveActiveContent();
     const formatted = formatCppCode(liveCode);
-    if (formatted !== codesRef.current[language]) {
-      const nextCodes = { ...codesRef.current, [language]: formatted };
-      codesRef.current = nextCodes;
-      setCodes(nextCodes);
+    if (formatted !== filesRef.current[active]?.content) {
+      const updatedFile = createVirtualFile(active, formatted);
+      const nextMap = { ...filesRef.current, [active]: updatedFile };
+      filesRef.current = nextMap;
+      setFilesMap(nextMap);
       if (autosaveEnabledRef.current) {
-        flushCodeToStorage(nextCodes);
+        void persistFile(updatedFile, nextMap);
       }
     }
     setFormattedFeedback(true);
@@ -425,7 +756,7 @@ export default function App() {
     formatTimerRef.current = setTimeout(() => {
       setFormattedFeedback(false);
     }, 1500);
-  }, [flushCodeToStorage, getLiveCode, language]);
+  }, [getLiveActiveContent, persistFile]);
 
   const handleToggleWordWrap = useCallback(() => {
     setWordWrapPreference(effectiveWordWrap ? 'off' : 'on');
@@ -468,66 +799,298 @@ export default function App() {
     }
   }, [status]);
 
+  const handleSelectFile = useCallback(
+    (name: string) => {
+      if (!filesRef.current[name]) return;
+      flushActiveEditorBuffer();
+      activeFileRef.current = name;
+      setActiveFileName(name);
+      if (name === 'main.cpp') setLanguage('cpp');
+      else if (name === 'main.c') setLanguage('c');
+
+      if (effectiveLayout === 'tabs') {
+        setActiveTab('editor');
+      }
+      if (viewport.width < 1024) {
+        setSidebarOpen(false);
+      }
+    },
+    [effectiveLayout, flushActiveEditorBuffer, viewport.width]
+  );
+
+  const handleCreateFile = useCallback(
+    (rawName: string): { ok: boolean; error?: string } => {
+      const check = validateFileName(rawName, Object.keys(filesRef.current));
+      if (!check.ok) {
+        return { ok: false, error: check.error };
+      }
+      flushActiveEditorBuffer();
+      const newFile = createVirtualFile(check.normalized, '');
+      const nextMap = { ...filesRef.current, [newFile.name]: newFile };
+      filesRef.current = nextMap;
+      setFilesMap(nextMap);
+      activeFileRef.current = newFile.name;
+      setActiveFileName(newFile.name);
+
+      void persistFile(newFile, nextMap);
+      showVfsStatus(`Создан файл: ${newFile.name}`);
+
+      if (effectiveLayout === 'tabs') {
+        setActiveTab('editor');
+      }
+      if (viewport.width < 1024) {
+        setSidebarOpen(false);
+      }
+      return { ok: true };
+    },
+    [effectiveLayout, flushActiveEditorBuffer, persistFile, showVfsStatus, viewport.width]
+  );
+
+  const handleRenameFile = useCallback(
+    (oldName: string, rawNewName: string): { ok: boolean; error?: string } => {
+      const current = filesRef.current[oldName];
+      if (!current) {
+        return { ok: false, error: 'Файл не найден.' };
+      }
+      const check = validateFileName(rawNewName, Object.keys(filesRef.current), oldName);
+      if (!check.ok) {
+        return { ok: false, error: check.error };
+      }
+      const nextName = check.normalized;
+      if (nextName === oldName) return { ok: true };
+
+      const syncedMap = flushActiveEditorBuffer();
+      const latestOld = syncedMap[oldName] ?? current;
+      const renamedFile = createVirtualFile(nextName, latestOld.bytes);
+
+      const nextMap: Record<string, VirtualFile> = { ...syncedMap };
+      delete nextMap[oldName];
+      nextMap[nextName] = renamedFile;
+      filesRef.current = nextMap;
+      setFilesMap(nextMap);
+
+      setRecentVfsChanges((prev) => {
+        if (!prev[oldName]) return prev;
+        const copy = { ...prev };
+        copy[nextName] = copy[oldName];
+        delete copy[oldName];
+        return copy;
+      });
+
+      if (activeFileRef.current === oldName) {
+        activeFileRef.current = nextName;
+        setActiveFileName(nextName);
+      }
+
+      syncEntryLocalStorage(nextMap);
+      void renameFileInIdb(oldName, renamedFile)
+        .then(() => setStorageError(null))
+        .catch((err) => reportStorageError(`Не удалось переименовать «${oldName}»`, err));
+      showVfsStatus(`Переименовано: ${nextName}`);
+      return { ok: true };
+    },
+    [flushActiveEditorBuffer, reportStorageError, showVfsStatus, syncEntryLocalStorage]
+  );
+
+  const handleDeleteFile = useCallback(
+    (name: string) => {
+      if (name === primaryEntryFile) return;
+      if (!filesRef.current[name]) return;
+
+      const syncedMap = flushActiveEditorBuffer();
+      const nextMap: Record<string, VirtualFile> = { ...syncedMap };
+      delete nextMap[name];
+      filesRef.current = nextMap;
+      setFilesMap(nextMap);
+
+      setRecentVfsChanges((prev) => {
+        if (!prev[name]) return prev;
+        const copy = { ...prev };
+        delete copy[name];
+        return copy;
+      });
+
+      if (activeFileRef.current === name) {
+        activeFileRef.current = primaryEntryFile;
+        setActiveFileName(primaryEntryFile);
+      }
+
+      void deleteFileFromIdb(name)
+        .then(() => setStorageError(null))
+        .catch((err) => reportStorageError(`Не удалось удалить «${name}» из IndexedDB`, err));
+      showVfsStatus(`Удалён файл: ${name}`);
+    },
+    [flushActiveEditorBuffer, primaryEntryFile, reportStorageError, showVfsStatus]
+  );
+
+  const handleImportFiles = useCallback(
+    (fileList: FileList) => {
+      const picked = Array.from(fileList);
+      if (picked.length === 0) return;
+
+      void (async () => {
+        try {
+          const syncedMap = flushActiveEditorBuffer();
+          const nextMap: Record<string, VirtualFile> = { ...syncedMap };
+          const importedFiles: VirtualFile[] = [];
+
+          for (const browserFile of picked) {
+            const normName = normalizeVirtualPath(browserFile.name);
+            if (!normName) continue;
+            const rawBytes = await readBrowserFileBytes(browserFile);
+            const vf = createVirtualFile(normName, rawBytes);
+            nextMap[vf.name] = vf;
+            importedFiles.push(vf);
+          }
+
+          if (importedFiles.length === 0) return;
+
+          filesRef.current = nextMap;
+          setFilesMap(nextMap);
+          syncEntryLocalStorage(nextMap);
+
+          const first = importedFiles[0];
+          const detectedLang = detectLanguageFromFileName(first.name);
+          if (first.name === 'main.cpp' || first.name === 'main.c') {
+            stopActiveSession();
+            if (detectedLang) setLanguage(detectedLang);
+          }
+
+          activeFileRef.current = first.name;
+          setActiveFileName(first.name);
+
+          await putFilesBatchToIdb(importedFiles);
+          setStorageError(null);
+          const now = Date.now();
+          safeWriteStorage(STORAGE_KEYS.lastSavedAt, String(now), undefined, now);
+          setLastSavedAt(now);
+
+          showVfsStatus(
+            importedFiles.length === 1
+              ? `Импортирован: ${first.name}`
+              : `Импортировано файлов: ${importedFiles.length}`
+          );
+          if (effectiveLayout === 'tabs') {
+            setActiveTab('editor');
+          }
+          if (viewport.width < 1024) {
+            setSidebarOpen(false);
+          }
+        } catch (err) {
+          reportStorageError('Ошибка импорта файлов в рабочую область', err);
+        }
+      })();
+    },
+    [
+      effectiveLayout,
+      flushActiveEditorBuffer,
+      reportStorageError,
+      showVfsStatus,
+      stopActiveSession,
+      syncEntryLocalStorage,
+      viewport.width,
+    ]
+  );
+
+  const handleExportSingleFile = useCallback(
+    (fileName: string) => {
+      const syncedMap = flushActiveEditorBuffer();
+      const target = syncedMap[fileName];
+      if (!target) return;
+
+      void exportSingleFileToDevice(target.name, target.bytes)
+        .then((mode) => {
+          if (mode !== 'cancelled') {
+            showVfsStatus(`Сохранено: ${target.name}`);
+          }
+        })
+        .catch((err) => {
+          reportStorageError(`Не удалось экспортировать «${target.name}»`, err);
+        });
+    },
+    [flushActiveEditorBuffer, reportStorageError, showVfsStatus]
+  );
+
+  const handleDownloadActiveFile = useCallback(() => {
+    handleExportSingleFile(activeFileRef.current);
+  }, [handleExportSingleFile]);
+
+  const handleExportAllZip = useCallback(() => {
+    const syncedMap = flushActiveEditorBuffer();
+    const entries = Object.values(syncedMap).map((f) => ({
+      name: f.name,
+      content: f.bytes,
+      updatedAt: f.updatedAt,
+    }));
+    if (entries.length === 0) return;
+
+    void exportWorkspaceZipToDevice(entries, 'cpp-workspace.zip')
+      .then((mode) => {
+        if (mode !== 'cancelled') {
+          showVfsStatus(`Экспортирован архив (${entries.length} ф.)`);
+        }
+      })
+      .catch((err) => {
+        reportStorageError('Не удалось создать ZIP-архив проекта', err);
+      });
+  }, [flushActiveEditorBuffer, reportStorageError, showVfsStatus]);
+
   const handleJumpToDiagnostic = useCallback(
     (line: number, column?: number | null) => {
-      if (effectiveLayout === 'tabs') {
+      const diagFile = diagnostics.find((d) => d.line === line)?.file ?? primaryEntryFile;
+      if (diagFile && filesRef.current[diagFile] && activeFileRef.current !== diagFile) {
+        flushActiveEditorBuffer();
+        activeFileRef.current = diagFile;
+        setActiveFileName(diagFile);
+        setTimeout(() => editorRef.current?.jumpToLine(line, column), 50);
+      } else if (effectiveLayout === 'tabs') {
         setActiveTab('editor');
         setTimeout(() => editorRef.current?.jumpToLine(line, column), 40);
       } else {
         editorRef.current?.jumpToLine(line, column);
       }
     },
-    [effectiveLayout]
-  );
-
-  const handleDownloadCode = useCallback(() => {
-    const filename = language === 'cpp' ? 'main.cpp' : 'main.c';
-    const liveCode = getLiveCode();
-    if (autosaveEnabledRef.current) {
-      const nextCodes = { ...codesRef.current, [language]: liveCode };
-      codesRef.current = nextCodes;
-      flushCodeToStorage(nextCodes);
-    }
-    const blob = new Blob([liveCode], { type: 'text/plain;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = filename;
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    URL.revokeObjectURL(url);
-  }, [flushCodeToStorage, getLiveCode, language]);
-
-  const handleImportCode = useCallback(
-    (content: string, detectedLang?: Language) => {
-      stopActiveSession();
-      const targetLang = detectedLang ?? language;
-      if (detectedLang) {
-        setLanguage(detectedLang);
-      }
-      const nextCodes = { ...codesRef.current, [targetLang]: content };
-      codesRef.current = nextCodes;
-      setCodes(nextCodes);
-      if (autosaveEnabledRef.current) {
-        flushCodeToStorage(nextCodes);
-      }
-      setDiagnostics([]);
-      setStatus('idle');
-    },
-    [flushCodeToStorage, language, stopActiveSession]
+    [diagnostics, effectiveLayout, flushActiveEditorBuffer, primaryEntryFile]
   );
 
   const handleSelectTemplate = useCallback(
     (tpl: CodeTemplate) => {
       stopActiveSession();
+      const targetEntry = tpl.language === 'cpp' ? 'main.cpp' : 'main.c';
       setLanguage(tpl.language);
-      const nextCodes = { ...codesRef.current, [tpl.language]: tpl.code };
-      codesRef.current = nextCodes;
-      setCodes(nextCodes);
-      if (autosaveEnabledRef.current) {
-        flushCodeToStorage(nextCodes);
+
+      const now = Date.now();
+      const updatedEntry = createVirtualFile(targetEntry, tpl.code, now);
+      const nextMap: Record<string, VirtualFile> = {
+        ...filesRef.current,
+        [targetEntry]: updatedEntry,
+      };
+      const toPersist: VirtualFile[] = [updatedEntry];
+
+      if (tpl.id === 'cpp-fstream' && !nextMap['input.txt']) {
+        const sampleInput = createVirtualFile('input.txt', DEFAULT_INPUT_TXT, now);
+        nextMap['input.txt'] = sampleInput;
+        toPersist.push(sampleInput);
       }
+
+      filesRef.current = nextMap;
+      setFilesMap(nextMap);
+      activeFileRef.current = targetEntry;
+      setActiveFileName(targetEntry);
+      setRecentVfsChanges({});
+
+      if (autosaveEnabledRef.current) {
+        syncEntryLocalStorage(nextMap, now);
+        void putFilesBatchToIdb(toPersist)
+          .then(() => {
+            setStorageError(null);
+            safeWriteStorage(STORAGE_KEYS.lastSavedAt, String(now), undefined, now);
+            setLastSavedAt(now);
+            setAutosaveState('saved');
+          })
+          .catch((err) => reportStorageError('Не удалось сохранить шаблон в IndexedDB', err));
+      }
+
       setDiagnostics([]);
       setChunks([]);
       setStatus('idle');
@@ -535,7 +1098,7 @@ export default function App() {
         setActiveTab('editor');
       }
     },
-    [effectiveLayout, flushCodeToStorage, stopActiveSession]
+    [effectiveLayout, reportStorageError, stopActiveSession, syncEntryLocalStorage]
   );
 
   const handleChangeFontSize = useCallback((delta: number) => {
@@ -576,7 +1139,7 @@ export default function App() {
       }
       if (key === 's') {
         e.preventDefault();
-        handleDownloadCode();
+        handleDownloadActiveFile();
         return;
       }
       if (key === 'b') {
@@ -610,7 +1173,7 @@ export default function App() {
     handleChangeFontSize,
     handleClearConsole,
     handleCycleLayoutAllThree,
-    handleDownloadCode,
+    handleDownloadActiveFile,
     handleFormatCode,
     handleRun,
     handleStop,
@@ -623,6 +1186,7 @@ export default function App() {
       stopActiveSession();
       if (formatTimerRef.current) clearTimeout(formatTimerRef.current);
       if (autosaveTimerRef.current) clearTimeout(autosaveTimerRef.current);
+      if (vfsToastTimerRef.current) clearTimeout(vfsToastTimerRef.current);
     };
   }, [stopActiveSession]);
 
@@ -665,7 +1229,13 @@ export default function App() {
     }
   };
 
-  const currentFileName = language === 'cpp' ? 'main.cpp' : 'main.c';
+  const fileModeLabel = useMemo(() => {
+    if (activeFileName === 'main.cpp') return `C++ (${currentStandard})`;
+    if (activeFileName === 'main.c') return `C (${currentStandard})`;
+    if (isCppSyntaxFile(activeFileName)) return 'C/C++';
+    if (currentFile?.isBinary || isBinaryFileName(activeFileName)) return 'Бинарный · только чтение';
+    return 'Текст';
+  }, [activeFileName, currentFile?.isBinary, currentStandard]);
 
   return (
     <div
@@ -686,9 +1256,19 @@ export default function App() {
         layoutPreference={layoutPreference}
         effectiveLayout={effectiveLayout}
         templates={CODE_TEMPLATES}
+        sidebarOpen={sidebarOpen}
+        fileCount={sortedFiles.length}
+        recentChangeCount={recentChangeCount}
+        onToggleSidebar={() => setSidebarOpen((v) => !v)}
         onChangeLanguage={(lang) => {
           stopActiveSession();
+          flushActiveEditorBuffer();
           setLanguage(lang);
+          const nextEntry = lang === 'cpp' ? 'main.cpp' : 'main.c';
+          if (activeFileRef.current === 'main.cpp' || activeFileRef.current === 'main.c') {
+            activeFileRef.current = nextEntry;
+            setActiveFileName(nextEntry);
+          }
           setDiagnostics([]);
           if (status === 'running' || status === 'compiling') {
             setStatus('idle');
@@ -702,8 +1282,8 @@ export default function App() {
         onSelectTheme={(nextTheme) => setThemeId(nextTheme)}
         onChangeFontSize={handleChangeFontSize}
         onSelectLayout={(nextLayout) => setLayoutPreference(nextLayout)}
-        onDownloadCode={handleDownloadCode}
-        onImportCode={handleImportCode}
+        onDownloadCode={handleDownloadActiveFile}
+        onImportFiles={handleImportFiles}
         onOpenShortcuts={() => setShortcutsOpen(true)}
         offlineReady={offlineReady}
         isOnline={isOnline}
@@ -727,7 +1307,7 @@ export default function App() {
                 : 'border-transparent text-[var(--app-text-secondary)] hover:text-[var(--app-text)]'
             }`}
           >
-            Код · {currentFileName}
+            Код · {activeFileName}
           </button>
           <button
             type="button"
@@ -746,219 +1326,265 @@ export default function App() {
         </div>
       )}
 
-      {/* Main Adaptive Split Workspace */}
-      <main
-        ref={workspaceRef}
-        data-layout={effectiveLayout}
-        className={`flex min-h-0 min-w-0 w-full flex-1 overflow-hidden ${
-          effectiveLayout === 'side-by-side' ? 'flex-row' : 'flex-col'
-        }`}
-      >
-        {/* Editor Pane: strictly flex-constrained with min-w-0 + overflow-hidden so code never goes under Console */}
-        <section
-          aria-label="Панель редактора кода"
-          data-testid="editor-pane"
-          className={`flex min-h-0 min-w-0 flex-col overflow-hidden ${
-            effectiveLayout === 'tabs' && activeTab !== 'editor' ? 'hidden' : 'flex'
-          } ${isDragging ? 'pointer-events-none select-none' : ''}`}
-          style={
-            effectiveLayout === 'side-by-side'
-              ? {
-                  flex: `0 0 ${splitRatio * 100}%`,
-                  width: `${splitRatio * 100}%`,
-                  maxWidth: `${splitRatio * 100}%`,
-                }
-              : effectiveLayout === 'stacked'
+      {/* Workspace Body: Collapsible Virtual Files Sidebar + Adaptive Editor/Console Split */}
+      <div className="flex min-h-0 min-w-0 w-full flex-1 overflow-hidden">
+        <WorkspaceSidebar
+          open={sidebarOpen}
+          isOverlayDrawer={viewport.width < 1024}
+          files={sortedFiles}
+          activeFileName={activeFileName}
+          primaryEntryFile={primaryEntryFile}
+          recentChanges={recentVfsChanges}
+          storageError={storageError}
+          statusMessage={vfsStatusMessage}
+          onClose={() => setSidebarOpen(false)}
+          onSelectFile={handleSelectFile}
+          onCreateFile={handleCreateFile}
+          onRenameFile={handleRenameFile}
+          onDeleteFile={handleDeleteFile}
+          onImportFiles={handleImportFiles}
+          onExportFile={handleExportSingleFile}
+          onExportAllZip={handleExportAllZip}
+          onDismissStorageError={() => setStorageError(null)}
+        />
+
+        {/* Main Adaptive Split Workspace */}
+        <main
+          ref={workspaceRef}
+          data-layout={effectiveLayout}
+          className={`flex min-h-0 min-w-0 w-full flex-1 overflow-hidden ${
+            effectiveLayout === 'side-by-side' ? 'flex-row' : 'flex-col'
+          }`}
+        >
+          {/* Editor Pane: strictly flex-constrained with min-w-0 + overflow-hidden so code never goes under Console */}
+          <section
+            aria-label="Панель редактора кода"
+            data-testid="editor-pane"
+            className={`flex min-h-0 min-w-0 flex-col overflow-hidden ${
+              effectiveLayout === 'tabs' && activeTab !== 'editor' ? 'hidden' : 'flex'
+            } ${isDragging ? 'pointer-events-none select-none' : ''}`}
+            style={
+              effectiveLayout === 'side-by-side'
                 ? {
                     flex: `0 0 ${splitRatio * 100}%`,
-                    height: `${splitRatio * 100}%`,
-                    maxHeight: `${splitRatio * 100}%`,
+                    width: `${splitRatio * 100}%`,
+                    maxWidth: `${splitRatio * 100}%`,
                   }
-                : { flex: '1 1 0%' }
-          }
-        >
-          {/* Editor sub-header: file info + Autosave status toggle + Word Wrap + Format (⌘⇧F) */}
-          <div className="flex h-10 shrink-0 items-center justify-between gap-2 border-b border-[var(--app-border)] bg-[var(--app-surface)] px-3 sm:px-3.5">
-            <div className="flex min-w-0 items-center gap-2 text-xs">
-              <span className="truncate font-mono font-semibold text-[var(--app-text)]">
-                {currentFileName}
-              </span>
-              <span aria-hidden="true" className="hidden min-[520px]:inline text-[var(--app-text-muted)]">
-                ·
-              </span>
-              <span className="hidden min-[520px]:inline truncate text-[var(--app-text-secondary)]">
-                {language === 'cpp' ? 'C++' : 'C'} ({currentStandard})
-              </span>
-              {diagSummary.errors > 0 && (
-                <>
-                  <span aria-hidden="true" className="text-[var(--app-text-muted)]">
-                    ·
-                  </span>
-                  <span className="font-medium text-rose-600 tabular-nums whitespace-nowrap dark:text-rose-400">
-                    Ошибок: {diagSummary.errors}
-                  </span>
-                </>
-              )}
-            </div>
-
-            <div className="flex shrink-0 items-center gap-1">
-              <button
-                type="button"
-                aria-pressed={autosaveEnabled}
-                onClick={handleToggleAutosave}
-                data-testid="autosave-toggle"
-                title={autosaveStatus.tooltip}
-                className={`inline-flex h-7 items-center gap-1.5 rounded-md px-2 text-xs font-medium transition-colors whitespace-nowrap ${
-                  autosaveState === 'error'
-                    ? 'text-rose-600 hover:bg-rose-500/10 dark:text-rose-400'
-                    : autosaveState === 'disabled'
-                      ? 'text-[var(--app-text-muted)] hover:bg-[var(--app-hover)] hover:text-[var(--app-text)]'
-                      : 'text-[var(--app-text-secondary)] hover:bg-[var(--app-hover)] hover:text-[var(--app-text)]'
-                }`}
-              >
-                {autosaveState === 'saving' ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin text-[var(--app-accent)]" />
-                ) : autosaveState === 'disabled' ? (
-                  <CloudOff className="h-3.5 w-3.5" />
-                ) : autosaveState === 'error' ? (
-                  <AlertCircle className="h-3.5 w-3.5" />
-                ) : (
-                  <CloudCheck className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />
-                )}
-                <span className="hidden min-[400px]:inline tabular-nums">
-                  {autosaveStatus.shortLabel}
-                </span>
-              </button>
-
-              <button
-                type="button"
-                aria-pressed={effectiveWordWrap}
-                onClick={handleToggleWordWrap}
-                title={
-                  effectiveWordWrap
-                    ? 'Перенос строк включён (нажмите, чтобы выключить)'
-                    : 'Перенос строк выключен (включается автоматически при узком экране)'
-                }
-                className={`inline-flex h-7 items-center gap-1.5 rounded-md px-2 text-xs font-medium transition-colors whitespace-nowrap ${
-                  effectiveWordWrap
-                    ? 'bg-[var(--app-accent-soft)] text-[var(--app-text)]'
-                    : 'text-[var(--app-text-secondary)] hover:bg-[var(--app-hover)] hover:text-[var(--app-text)]'
-                }`}
-              >
-                <WrapText className="h-3.5 w-3.5" />
-                <span className="hidden sm:inline">Перенос</span>
-              </button>
-
-              <button
-                type="button"
-                onClick={handleFormatCode}
-                aria-label="Форматировать код"
-                title="Форматировать код (⌘⇧F)"
-                className="inline-flex h-7 items-center gap-1.5 rounded-md px-2 text-xs font-medium text-[var(--app-text-secondary)] transition-colors hover:bg-[var(--app-hover)] hover:text-[var(--app-text)] whitespace-nowrap"
-              >
-                {formattedFeedback ? (
-                  <Check className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />
-                ) : (
-                  <AlignLeft className="h-3.5 w-3.5" />
-                )}
-                <span>{formattedFeedback ? 'Готово' : 'Формат'}</span>
-                <span className="hidden xl:inline font-mono text-[10px] text-[var(--app-text-muted)]">
-                  ⌘⇧F
-                </span>
-              </button>
-            </div>
-          </div>
-
-          <div className="min-h-0 min-w-0 w-full flex-1 overflow-hidden">
-            <CodeEditor
-              ref={editorRef}
-              value={currentCode}
-              onChange={(next) => {
-                const nextCodes = { ...codesRef.current, [language]: next };
-                codesRef.current = nextCodes;
-                setCodes(nextCodes);
-                scheduleAutosave(nextCodes);
-              }}
-              theme={activeTheme}
-              fontSize={fontSize}
-              lineWrapping={effectiveWordWrap}
-              diagnostics={diagnostics}
-              onRun={() => void handleRun()}
-              onFormat={handleFormatCode}
-              onWidthChange={setEditorWidth}
-            />
-          </div>
-        </section>
-
-        {/* Draggable Split Handle (Magic Keyboard trackpad + iPad touch/stylus) */}
-        {effectiveLayout !== 'tabs' && (
-          <div
-            role="separator"
-            aria-orientation={effectiveLayout === 'side-by-side' ? 'vertical' : 'horizontal'}
-            aria-label="Изменить размер панелей"
-            data-testid="split-divider"
-            onPointerDown={handleDividerPointerDown}
-            onPointerMove={handleDividerPointerMove}
-            onPointerUp={finishDividerDrag}
-            onPointerCancel={finishDividerDrag}
-            onDoubleClick={() => setSplitRatio(0.5)}
-            className={`group relative z-10 flex shrink-0 touch-none select-none items-center justify-center transition-colors ${
-              isDragging
-                ? 'bg-[var(--app-accent)]'
-                : 'bg-[var(--app-border)] hover:bg-[var(--app-accent)]'
-            } ${
-              effectiveLayout === 'side-by-side'
-                ? 'w-1.5 cursor-col-resize'
-                : 'h-1.5 cursor-row-resize'
-            }`}
+                : effectiveLayout === 'stacked'
+                  ? {
+                      flex: `0 0 ${splitRatio * 100}%`,
+                      height: `${splitRatio * 100}%`,
+                      maxHeight: `${splitRatio * 100}%`,
+                    }
+                  : { flex: '1 1 0%' }
+            }
           >
-            {/* Subtle tactile grip bar for iPad trackpad & touch */}
+            {/* Editor sub-header: active file info + back to entry + Autosave toggle + Word Wrap + Format */}
+            <div className="flex h-10 shrink-0 items-center justify-between gap-2 border-b border-[var(--app-border)] bg-[var(--app-surface)] px-3 sm:px-3.5">
+              <div className="flex min-w-0 items-center gap-2 text-xs">
+                {activeFileName !== primaryEntryFile && (
+                  <button
+                    type="button"
+                    onClick={() => handleSelectFile(primaryEntryFile)}
+                    aria-label={`Вернуться к ${primaryEntryFile}`}
+                    title={`Перейти к ${primaryEntryFile}`}
+                    className="inline-flex h-7 shrink-0 items-center gap-1 rounded-md border border-[var(--app-border)] bg-[var(--app-elevated)] px-2 font-mono text-[11px] font-medium text-[var(--app-text-secondary)] transition-colors hover:bg-[var(--app-hover)] hover:text-[var(--app-text)]"
+                  >
+                    <ArrowLeft className="h-3 w-3" />
+                    <span className="hidden sm:inline">{primaryEntryFile}</span>
+                  </button>
+                )}
+                <span
+                  data-testid="active-file-label"
+                  className="truncate font-mono font-semibold text-[var(--app-text)]"
+                >
+                  {activeFileName}
+                </span>
+                <span aria-hidden="true" className="hidden min-[520px]:inline text-[var(--app-text-muted)]">
+                  ·
+                </span>
+                <span className="hidden min-[520px]:inline truncate text-[var(--app-text-secondary)]">
+                  {fileModeLabel}
+                </span>
+                {diagSummary.errors > 0 && (
+                  <>
+                    <span aria-hidden="true" className="text-[var(--app-text-muted)]">
+                      ·
+                    </span>
+                    <span className="font-medium text-rose-600 tabular-nums whitespace-nowrap dark:text-rose-400">
+                      Ошибок: {diagSummary.errors}
+                    </span>
+                  </>
+                )}
+              </div>
+
+              <div className="flex shrink-0 items-center gap-1">
+                <button
+                  type="button"
+                  aria-pressed={autosaveEnabled}
+                  onClick={handleToggleAutosave}
+                  data-testid="autosave-toggle"
+                  title={autosaveStatus.tooltip}
+                  className={`inline-flex h-7 items-center gap-1.5 rounded-md px-2 text-xs font-medium transition-colors whitespace-nowrap ${
+                    autosaveState === 'error'
+                      ? 'text-rose-600 hover:bg-rose-500/10 dark:text-rose-400'
+                      : autosaveState === 'disabled'
+                        ? 'text-[var(--app-text-muted)] hover:bg-[var(--app-hover)] hover:text-[var(--app-text)]'
+                        : 'text-[var(--app-text-secondary)] hover:bg-[var(--app-hover)] hover:text-[var(--app-text)]'
+                  }`}
+                >
+                  {autosaveState === 'saving' ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin text-[var(--app-accent)]" />
+                  ) : autosaveState === 'disabled' ? (
+                    <CloudOff className="h-3.5 w-3.5" />
+                  ) : autosaveState === 'error' ? (
+                    <AlertCircle className="h-3.5 w-3.5" />
+                  ) : (
+                    <CloudCheck className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />
+                  )}
+                  <span className="hidden min-[400px]:inline tabular-nums">
+                    {autosaveStatus.shortLabel}
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  aria-pressed={effectiveWordWrap}
+                  onClick={handleToggleWordWrap}
+                  title={
+                    effectiveWordWrap
+                      ? 'Перенос строк включён (нажмите, чтобы выключить)'
+                      : 'Перенос строк выключен (включается автоматически при узком экране)'
+                  }
+                  className={`inline-flex h-7 items-center gap-1.5 rounded-md px-2 text-xs font-medium transition-colors whitespace-nowrap ${
+                    effectiveWordWrap
+                      ? 'bg-[var(--app-accent-soft)] text-[var(--app-text)]'
+                      : 'text-[var(--app-text-secondary)] hover:bg-[var(--app-hover)] hover:text-[var(--app-text)]'
+                  }`}
+                >
+                  <WrapText className="h-3.5 w-3.5" />
+                  <span className="hidden sm:inline">Перенос</span>
+                </button>
+
+                {currentSyntaxMode === 'cpp' && (
+                  <button
+                    type="button"
+                    onClick={handleFormatCode}
+                    aria-label="Форматировать код"
+                    title="Форматировать код (⌘⇧F)"
+                    className="inline-flex h-7 items-center gap-1.5 rounded-md px-2 text-xs font-medium text-[var(--app-text-secondary)] transition-colors hover:bg-[var(--app-hover)] hover:text-[var(--app-text)] whitespace-nowrap"
+                  >
+                    {formattedFeedback ? (
+                      <Check className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />
+                    ) : (
+                      <AlignLeft className="h-3.5 w-3.5" />
+                    )}
+                    <span>{formattedFeedback ? 'Готово' : 'Формат'}</span>
+                    <span className="hidden xl:inline font-mono text-[10px] text-[var(--app-text-muted)]">
+                      ⌘⇧F
+                    </span>
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <div className="min-h-0 min-w-0 w-full flex-1 overflow-hidden">
+              <CodeEditor
+                ref={editorRef}
+                value={currentContent}
+                onChange={(next) => {
+                  const active = activeFileRef.current;
+                  if (filesRef.current[active]?.isBinary) return;
+                  userEditedBeforeHydrationRef.current = true;
+                  const updatedFile = createVirtualFile(active, next);
+                  const nextMap = { ...filesRef.current, [active]: updatedFile };
+                  filesRef.current = nextMap;
+                  setFilesMap(nextMap);
+                  scheduleAutosave(updatedFile, nextMap);
+                }}
+                theme={activeTheme}
+                fontSize={fontSize}
+                lineWrapping={currentFile?.isBinary ? false : effectiveWordWrap}
+                syntaxMode={currentSyntaxMode}
+                readOnly={Boolean(currentFile?.isBinary)}
+                diagnostics={visibleEditorDiagnostics}
+                onRun={() => void handleRun()}
+                onFormat={handleFormatCode}
+                onWidthChange={setEditorWidth}
+              />
+            </div>
+          </section>
+
+          {/* Draggable Split Handle (Magic Keyboard trackpad + iPad touch/stylus) */}
+          {effectiveLayout !== 'tabs' && (
             <div
-              aria-hidden="true"
-              className={`rounded-full transition-colors ${
+              role="separator"
+              aria-orientation={effectiveLayout === 'side-by-side' ? 'vertical' : 'horizontal'}
+              aria-label="Изменить размер панелей"
+              data-testid="split-divider"
+              onPointerDown={handleDividerPointerDown}
+              onPointerMove={handleDividerPointerMove}
+              onPointerUp={finishDividerDrag}
+              onPointerCancel={finishDividerDrag}
+              onDoubleClick={() => setSplitRatio(0.5)}
+              className={`group relative z-10 flex shrink-0 touch-none select-none items-center justify-center transition-colors ${
                 isDragging
-                  ? 'bg-white/90'
-                  : 'bg-[var(--app-text-muted)]/60 group-hover:bg-white/90'
-              } ${effectiveLayout === 'side-by-side' ? 'h-8 w-0.5' : 'h-0.5 w-8'}`}
-            />
-            {/* Expanded invisible hit target for effortless iPad touch & stylus grabbing */}
-            <div
-              className={
+                  ? 'bg-[var(--app-accent)]'
+                  : 'bg-[var(--app-border)] hover:bg-[var(--app-accent)]'
+              } ${
                 effectiveLayout === 'side-by-side'
-                  ? 'absolute inset-y-0 -left-2.5 -right-2.5'
-                  : 'absolute inset-x-0 -top-2.5 -bottom-2.5'
-              }
+                  ? 'w-1.5 cursor-col-resize'
+                  : 'h-1.5 cursor-row-resize'
+              }`}
+            >
+              {/* Subtle tactile grip bar for iPad trackpad & touch */}
+              <div
+                aria-hidden="true"
+                className={`rounded-full transition-colors ${
+                  isDragging
+                    ? 'bg-white/90'
+                    : 'bg-[var(--app-text-muted)]/60 group-hover:bg-white/90'
+                } ${effectiveLayout === 'side-by-side' ? 'h-8 w-0.5' : 'h-0.5 w-8'}`}
+              />
+              {/* Expanded invisible hit target for effortless iPad touch & stylus grabbing */}
+              <div
+                className={
+                  effectiveLayout === 'side-by-side'
+                    ? 'absolute inset-y-0 -left-2.5 -right-2.5'
+                    : 'absolute inset-x-0 -top-2.5 -bottom-2.5'
+                }
+              />
+            </div>
+          )}
+
+          {/* Console Pane: strictly flex-1 with min-w-0 + overflow-hidden */}
+          <div
+            data-testid="console-pane"
+            className={`min-h-0 min-w-0 flex-1 overflow-hidden ${
+              effectiveLayout === 'tabs' && activeTab !== 'console' ? 'hidden' : 'flex'
+            } ${isDragging ? 'pointer-events-none select-none' : ''}`}
+          >
+            <ConsolePanel
+              ref={consoleRef}
+              runId={runId}
+              status={status}
+              chunks={chunks}
+              diagnostics={diagnostics}
+              rawCompilerOutput={rawCompilerOutput}
+              compileTimeMs={compileTimeMs}
+              runDurationMs={runDurationMs}
+              exitCode={exitCode}
+              exitReason={exitReason}
+              fontSize={fontSize}
+              onSendInput={(line) => void handleSendInput(line)}
+              onSendEof={() => void handleSendEof()}
+              onStop={() => void handleStop()}
+              onClear={handleClearConsole}
+              onJumpToDiagnostic={handleJumpToDiagnostic}
             />
           </div>
-        )}
-
-        {/* Console Pane: strictly flex-1 with min-w-0 + overflow-hidden */}
-        <div
-          data-testid="console-pane"
-          className={`min-h-0 min-w-0 flex-1 overflow-hidden ${
-            effectiveLayout === 'tabs' && activeTab !== 'console' ? 'hidden' : 'flex'
-          } ${isDragging ? 'pointer-events-none select-none' : ''}`}
-        >
-          <ConsolePanel
-            ref={consoleRef}
-            runId={runId}
-            status={status}
-            chunks={chunks}
-            diagnostics={diagnostics}
-            rawCompilerOutput={rawCompilerOutput}
-            compileTimeMs={compileTimeMs}
-            runDurationMs={runDurationMs}
-            exitCode={exitCode}
-            exitReason={exitReason}
-            fontSize={fontSize}
-            onSendInput={(line) => void handleSendInput(line)}
-            onSendEof={() => void handleSendEof()}
-            onStop={() => void handleStop()}
-            onClear={handleClearConsole}
-            onJumpToDiagnostic={handleJumpToDiagnostic}
-          />
-        </div>
-      </main>
+        </main>
+      </div>
 
       <ShortcutsModal open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
 

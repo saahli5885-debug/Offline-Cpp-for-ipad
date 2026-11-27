@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { CODE_TEMPLATES, DEFAULT_CODE } from '../data/templates';
+import { decodeUtf8 } from '../vfs/vfsHelpers';
 import { BrowserCppSession, compileInBrowser } from './cppEngine';
 
 function runWithInputs(
@@ -502,4 +503,453 @@ int main() { return boom(0); }`;
   assert.equal(res.exitCode, 1);
   assert.match(res.stderr, /Stack overflow/i);
 });
+
+test('bidirectional <fstream> mounts initial VFS, syncs live on flush/close/remove, and supports in/out/app/trunc/binary modes', async () => {
+  const code = `#include <fstream>
+#include <iostream>
+#include <cstdio>
+#include <string>
+using namespace std;
+
+int main() {
+    // 1. Missing file check with ifstream
+    ifstream missing("does_not_exist.txt");
+    cout << "MISS_OPEN=" << (missing.is_open() ? 1 : 0) << " FAIL=" << (missing.fail() ? 1 : 0) << "\\n";
+
+    // 2. Read mounted input.txt with >> and getline + eof
+    ifstream in("./input.txt");
+    int a = 0, b = 0;
+    in >> a >> b;
+    string label;
+    getline(in >> ws, label);
+    string extra;
+    getline(in, extra);
+    cout << "READ=" << (a + b) << "|" << label << "|EOF=" << (in.eof() ? 1 : 0) << "\\n";
+    in.close();
+
+    // 3. Write output.txt and flush mid-run
+    ofstream out("output.txt");
+    out << "SUM=" << (a + b) << "\\n" << flush;
+    out << "LABEL=" << label << "\\n";
+    out.close();
+
+    // 4. Append mode on existing log.txt
+    ofstream log("log.txt", ios::out | ios::app);
+    log << "second\\n";
+    log.close();
+
+    // 5. Binary fstream write + read + gcount + seekg
+    fstream bin("data.bin", ios::in | ios::out | ios::trunc | ios::binary);
+    char rawOut[4] = {'A', 'B', 'C', 'D'};
+    bin.write(rawOut, 4);
+    bin.flush();
+    bin.seekg(1, ios::beg);
+    char rawIn[2] = {0, 0};
+    bin.read(rawIn, 2);
+    cout << "BIN=" << rawIn[0] << rawIn[1] << "|GCOUNT=" << bin.gcount() << "\\n";
+    bin.close();
+
+    // 6. Delete temp.txt via std::remove
+    int rmRes = remove("temp.txt");
+    cout << "RM=" << rmRes << "\\n";
+    return 0;
+}`;
+
+  const initialFiles = {
+    'input.txt': '15 27\nПривет мир\n',
+    'log.txt': 'first\n',
+    'temp.txt': 'to be removed',
+  };
+
+  const compiled = compileInBrowser(code, 'cpp', initialFiles);
+  assert.equal(compiled.ok, true, compiled.rawCompilerOutput);
+
+  const liveEvents: Array<{ path: string; action: string }> = [];
+  let finalSnapshot: Record<string, Uint8Array> = {};
+  let stdout = '';
+  let stderr = '';
+
+  const exitCode = await new Promise<number | null>((resolve) => {
+    const session = new BrowserCppSession(compiled.program!, {
+      initialFiles,
+      onStdout: (chunk) => {
+        stdout += chunk;
+      },
+      onStderr: (chunk) => {
+        stderr += chunk;
+      },
+      onVfsChange: (event) => {
+        liveEvents.push({ path: event.path, action: event.action });
+      },
+      onVfsFinalSync: (snap) => {
+        finalSnapshot = snap;
+      },
+      onExit: ({ code: c }) => resolve(c),
+    });
+    session.sendEof();
+  });
+
+  assert.equal(exitCode, 0, stderr);
+  assert.equal(
+    stdout,
+    'MISS_OPEN=0 FAIL=1\nREAD=42|Привет мир|EOF=1\nBIN=BC|GCOUNT=2\nRM=0\n'
+  );
+  assert.equal(decodeUtf8(finalSnapshot['output.txt']), 'SUM=42\nLABEL=Привет мир\n');
+  assert.equal(decodeUtf8(finalSnapshot['log.txt']), 'first\nsecond\n');
+  assert.deepEqual(Array.from(finalSnapshot['data.bin']), [65, 66, 67, 68]);
+  assert.equal('temp.txt' in finalSnapshot, false);
+  assert.ok(liveEvents.some((e) => e.path === 'output.txt' && e.action === 'create'));
+  assert.ok(liveEvents.some((e) => e.path === 'output.txt' && e.action === 'modify'));
+  assert.ok(liveEvents.some((e) => e.path === 'temp.txt' && e.action === 'delete'));
+});
+
+test('resolves local quoted #include headers from Virtual Workspace files', async () => {
+  const virtualFiles = {
+    'helper.h': `#pragma once
+int triple(int x) {
+    return x * 3;
+}
+`,
+  };
+  const code = `#include <iostream>
+#include "helper.h"
+using namespace std;
+int main() {
+    cout << triple(14) << "\\n";
+    return 0;
+}`;
+
+  const compiled = compileInBrowser(code, 'cpp', virtualFiles);
+  assert.equal(compiled.ok, true, compiled.rawCompilerOutput);
+
+  let stdout = '';
+  let stderr = '';
+  const exitCode = await new Promise<number | null>((resolve) => {
+    const session = new BrowserCppSession(compiled.program!, {
+      initialFiles: virtualFiles,
+      onStdout: (c) => {
+        stdout += c;
+      },
+      onStderr: (c) => {
+        stderr += c;
+      },
+      onExit: ({ code: c }) => resolve(c),
+    });
+    session.sendEof();
+  });
+
+  assert.equal(exitCode, 0, stderr);
+  assert.equal(stdout, '42\n');
+});
+
+test('C <stdio.h> FILE* binary struct/array fwrite/fread, fseek/ftell/rewind/feof/clearerr, NULL check, and auto-flush unclosed FILE*', async () => {
+  const code = `#include <stdio.h>
+
+struct Item {
+    int id;
+    double price;
+    float weight;
+    char tag[8];
+    char active;
+};
+
+int main(void) {
+    // Missing file in "rb" mode must return NULL
+    FILE* missing = fopen("no_such_file.bin", "rb");
+    printf("MISS=%d\\n", (missing == NULL && !missing) ? 1 : 0);
+
+    // Exact serialized sizeof(struct Item) = 4 + 8 + 4 + 8 + 1 = 25 bytes
+    struct Item items[2] = {
+        {10, 19.75, 2.5f, "Pen", 1},
+        {20, 42.125, 0.5f, "Book", 0}
+    };
+    printf("SZ=%zu:%zu\\n", sizeof(struct Item), sizeof(items));
+
+    FILE* wf = fopen("items.bin", "wb");
+    if (wf == NULL) return 1;
+    size_t nw = fwrite(items, sizeof(struct Item), 2, wf);
+    int rc = fclose(wf);
+    printf("W=%zu RC=%d\\n", nw, rc);
+
+    // Open in "rb", seek to end/cur/set, read back
+    FILE* rf = fopen("items.bin", "rb");
+    if (!rf) return 1;
+    fseek(rf, 0, SEEK_END);
+    long totalBytes = ftell(rf);
+    // Seek directly to 2nd record via SEEK_SET
+    fseek(rf, (long)sizeof(struct Item), SEEK_SET);
+    struct Item second;
+    size_t nr1 = fread(&second, sizeof(struct Item), 1, rf);
+    printf("LEN=%ld NR1=%zu SECOND=%d|%.3f|%.1f|%s|%d\\n",
+           totalBytes, nr1, second.id, second.price, second.weight, second.tag, (int)second.active);
+
+    // Reading past EOF triggers feof; clearerr resets it; rewind returns to 0
+    struct Item extra;
+    size_t nrEof = fread(&extra, sizeof(struct Item), 1, rf);
+    int eofBefore = feof(rf);
+    clearerr(rf);
+    int eofAfter = feof(rf);
+    rewind(rf);
+    long posAfterRewind = ftell(rf);
+
+    struct Item loaded[2];
+    size_t nrAll = fread(loaded, sizeof(struct Item), 2, rf);
+    fclose(rf);
+    printf("EOF=%zu:%d:%d:%ld ALL=%zu FIRST=%d|%s\\n",
+           nrEof, eofBefore, eofAfter, posAfterRewind, nrAll, loaded[0].id, loaded[0].tag);
+
+    // Leave a dirty FILE* intentionally unclosed — runtime must auto-flush it on main() exit!
+    FILE* dirty = fopen("unclosed.bin", "wb");
+    int magic = 0x01020304;
+    fwrite(&magic, sizeof(int), 1, dirty);
+    return 0;
+}`;
+
+  const compiled = compileInBrowser(code, 'c');
+  assert.equal(compiled.ok, true, compiled.rawCompilerOutput);
+
+  let finalSnapshot: Record<string, Uint8Array> = {};
+  let stdout = '';
+  let stderr = '';
+
+  const exitCode = await new Promise<number | null>((resolve) => {
+    const session = new BrowserCppSession(compiled.program!, {
+      onStdout: (c) => {
+        stdout += c;
+      },
+      onStderr: (c) => {
+        stderr += c;
+      },
+      onVfsFinalSync: (snap) => {
+        finalSnapshot = snap;
+      },
+      onExit: ({ code: c }) => resolve(c),
+    });
+    session.sendEof();
+  });
+
+  assert.equal(exitCode, 0, stderr);
+  assert.equal(
+    stdout,
+    'MISS=1\nSZ=25:50\nW=2 RC=0\nLEN=50 NR1=1 SECOND=20|42.125|0.5|Book|0\nEOF=0:1:0:0 ALL=2 FIRST=10|Pen\n'
+  );
+
+  // Raw Uint8Array must hold exact 50 bytes including embedded \0 null bytes!
+  const itemsBin = finalSnapshot['items.bin'];
+  assert.ok(itemsBin instanceof Uint8Array);
+  assert.equal(itemsBin.byteLength, 50);
+  assert.equal(itemsBin.includes(0), true);
+
+  // Verify little-endian DataView encoding of record 0 directly in VFS Uint8Array
+  const dv = new DataView(itemsBin.buffer, itemsBin.byteOffset, itemsBin.byteLength);
+  assert.equal(dv.getInt32(0, true), 10);
+  assert.equal(dv.getFloat64(4, true), 19.75);
+  assert.equal(dv.getFloat32(12, true), 2.5);
+  assert.equal(itemsBin[16], 'P'.charCodeAt(0));
+  assert.equal(itemsBin[17], 'e'.charCodeAt(0));
+  assert.equal(itemsBin[18], 'n'.charCodeAt(0));
+  assert.equal(itemsBin[19], 0); // null terminator preserved!
+  assert.equal(itemsBin[24], 1);
+
+  // Auto-flushed unclosed FILE* must be present with exact little-endian bytes [04, 03, 02, 01]
+  const unclosedBin = finalSnapshot['unclosed.bin'];
+  assert.ok(unclosedBin instanceof Uint8Array);
+  assert.deepEqual(Array.from(unclosedBin), [0x04, 0x03, 0x02, 0x01]);
+});
+
+test('C++ <cstdio> with std:: namespace supports fprintf, fscanf, fgets, fputs, fgetc/fputc, modes a/r+/w+/a+, rename, and remove', async () => {
+  const code = `#include <cstdio>
+#include <iostream>
+using namespace std;
+
+int main() {
+    // 1. std::fopen("w") + std::fprintf + std::fputs + std::fputc
+    std::FILE* f = std::fopen("notes.txt", "w");
+    if (f == nullptr) return 1;
+    std::fprintf(f, "%d %.2f %s\\n", 42, 3.5, "alpha");
+    std::fputs("second line\\n", f);
+    std::fputc('Z', f);
+    std::fputc('\\n', f);
+    std::fclose(f);
+
+    // 2. Append mode "a"
+    std::FILE* fa = std::fopen("notes.txt", "a");
+    std::fputs("appended\\n", fa);
+    std::fclose(fa);
+
+    // 3. Read back with std::fscanf, std::fgets, std::fgetc + std::ungetc
+    std::FILE* fr = std::fopen("notes.txt", "r");
+    int num = 0;
+    double dbl = 0.0;
+    char word[16];
+    int matched = std::fscanf(fr, "%d %lf %15s", &num, &dbl, word);
+    int nl = std::fgetc(fr); // consume trailing newline
+    char line2[32];
+    std::fgets(line2, 32, fr);
+    int ch = std::fgetc(fr);
+    std::ungetc(ch, fr);
+    int chAgain = std::getc(fr);
+    std::fclose(fr);
+
+    cout << "SCAN=" << matched << ":" << num << ":" << dbl << ":" << word << "|NL=" << (nl == '\\n' ? 1 : 0) << "\\n";
+    cout << "LINE2=" << line2;
+    cout << "CH=" << static_cast<char>(ch) << static_cast<char>(chAgain) << "\\n";
+
+    // 4. Read/write update mode "r+" with fseek + SEEK_CUR
+    std::FILE* rw = std::fopen("notes.txt", "r+");
+    std::fseek(rw, 0, SEEK_SET);
+    std::fputc('9', rw);
+    std::fseek(rw, 0, SEEK_CUR);
+    int secondChar = std::fgetc(rw);
+    std::fclose(rw);
+    cout << "RW2=" << static_cast<char>(secondChar) << "\\n";
+
+    // 5. w+ create & read back in same handle
+    std::FILE* wp = std::fopen("temp_wp.txt", "w+");
+    std::fputs("hello_wp", wp);
+    std::rewind(wp);
+    char buf[16];
+    std::fgets(buf, 16, wp);
+    std::fclose(wp);
+    cout << "WP=" << buf << "\\n";
+
+    // 6. std::rename & std::remove
+    int ren = std::rename("temp_wp.txt", "renamed.txt");
+    int rem = std::remove("obsolete.txt");
+    cout << "REN=" << ren << " REM=" << rem << "\\n";
+    return 0;
+}`;
+
+  const initialFiles = {
+    'obsolete.txt': 'delete me',
+  };
+  const compiled = compileInBrowser(code, 'cpp', initialFiles);
+  assert.equal(compiled.ok, true, compiled.rawCompilerOutput);
+
+  let finalSnapshot: Record<string, Uint8Array> = {};
+  let stdout = '';
+  let stderr = '';
+
+  const exitCode = await new Promise<number | null>((resolve) => {
+    const session = new BrowserCppSession(compiled.program!, {
+      initialFiles,
+      onStdout: (c) => {
+        stdout += c;
+      },
+      onStderr: (c) => {
+        stderr += c;
+      },
+      onVfsFinalSync: (snap) => {
+        finalSnapshot = snap;
+      },
+      onExit: ({ code: c }) => resolve(c),
+    });
+    session.sendEof();
+  });
+
+  assert.equal(exitCode, 0, stderr);
+  assert.equal(
+    stdout,
+    'SCAN=3:42:3.5:alpha|NL=1\nLINE2=second line\nCH=ZZ\nRW2=2\nWP=hello_wp\nREN=0 REM=0\n'
+  );
+  assert.equal(decodeUtf8(finalSnapshot['renamed.txt']), 'hello_wp');
+  assert.equal('temp_wp.txt' in finalSnapshot, false);
+  assert.equal('obsolete.txt' in finalSnapshot, false);
+  assert.equal(decodeUtf8(finalSnapshot['notes.txt']).startsWith('92 3.50 alpha\n'), true);
+});
+
+test('C++ std::ios::binary .write()/.read() with reinterpret_cast<char*> serializes primitives, arrays, and structs cleanly', async () => {
+  const code = `#include <fstream>
+#include <iostream>
+using namespace std;
+
+struct Sensor {
+    int id;
+    double temp;
+    bool ok;
+    char code[6];
+};
+
+int main() {
+    int count = 2;
+    double bias = -1.25;
+    Sensor list[2] = {
+        {7, 23.5, true, "S01"},
+        {8, -4.75, false, "S02"}
+    };
+
+    ofstream out("sensors.bin", ios::out | ios::binary);
+    out.write(reinterpret_cast<char*>(&count), sizeof(count));
+    out.write(reinterpret_cast<char*>(&bias), sizeof(bias));
+    out.write(reinterpret_cast<char*>(list), sizeof(list));
+    out.close();
+
+    ifstream in("sensors.bin", ios::in | ios::binary);
+    int rCount = 0;
+    double rBias = 0.0;
+    in.read(reinterpret_cast<char*>(&rCount), sizeof(rCount));
+    in.read(reinterpret_cast<char*>(&rBias), sizeof(rBias));
+    cout << "HDR=" << rCount << "|" << rBias << "|SZ=" << sizeof(Sensor) << "\\n";
+
+    Sensor s;
+    while (in.read(reinterpret_cast<char*>(&s), sizeof(Sensor))) {
+        cout << s.id << ":" << s.temp << ":" << (s.ok ? 1 : 0) << ":" << s.code << "|G=" << in.gcount() << "\\n";
+    }
+    cout << "EOF=" << (in.eof() ? 1 : 0) << "\\n";
+    in.close();
+    return 0;
+}`;
+
+  const compiled = compileInBrowser(code, 'cpp');
+  assert.equal(compiled.ok, true, compiled.rawCompilerOutput);
+
+  let finalSnapshot: Record<string, Uint8Array> = {};
+  let stdout = '';
+  let stderr = '';
+
+  const exitCode = await new Promise<number | null>((resolve) => {
+    const session = new BrowserCppSession(compiled.program!, {
+      onStdout: (c) => {
+        stdout += c;
+      },
+      onStderr: (c) => {
+        stderr += c;
+      },
+      onVfsFinalSync: (snap) => {
+        finalSnapshot = snap;
+      },
+      onExit: ({ code: c }) => resolve(c),
+    });
+    session.sendEof();
+  });
+
+  assert.equal(exitCode, 0, stderr);
+  // sizeof(Sensor) = 4 + 8 + 1 + 6 = 19 bytes; total file = 4 + 8 + 2*19 = 50 bytes
+  assert.equal(
+    stdout,
+    'HDR=2|-1.25|SZ=19\n7:23.5:1:S01|G=19\n8:-4.75:0:S02|G=19\nEOF=1\n'
+  );
+  const bin = finalSnapshot['sensors.bin'];
+  assert.ok(bin instanceof Uint8Array);
+  assert.equal(bin.byteLength, 50);
+  assert.equal(bin.includes(0), true);
+});
+
+test('runs built-in binary templates (cpp-binary-fstream and c-binary-stdio) cleanly', async () => {
+  const cppBinTpl = CODE_TEMPLATES.find((t) => t.id === 'cpp-binary-fstream')!;
+  const cppRes = await runWithInputs(cppBinTpl.code, 'cpp', []);
+  assert.equal(cppRes.exitCode, 0, cppRes.stderr);
+  assert.match(cppRes.stdout, /sizeof\(Record\) = 24 Б/);
+  assert.match(cppRes.stdout, /#101 Alice -> 98\.5/);
+  assert.match(cppRes.stdout, /#102 Bob -> 87\.25/);
+
+  const cBinTpl = CODE_TEMPLATES.find((t) => t.id === 'c-binary-stdio')!;
+  const cRes = await runWithInputs(cBinTpl.code, 'c', []);
+  assert.equal(cRes.exitCode, 0, cRes.stderr);
+  assert.match(cRes.stdout, /Записано записей: 2 \(sizeof = 24 Б\)/);
+  assert.match(cRes.stdout, /Размер файла: 48 Б, прочитано: 2/);
+  assert.match(cRes.stdout, /\[1\] Notebook — 19\.99/);
+  assert.match(cRes.stdout, /\[2\] Pencil — 4\.50/);
+});
+
 

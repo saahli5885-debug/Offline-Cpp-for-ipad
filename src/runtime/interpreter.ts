@@ -15,6 +15,41 @@ import {
   StreamAbortError,
   type StreamFormatFlags,
 } from './streams';
+import type { VfsRuntimeChangeEvent } from '../vfs/types';
+import {
+  bytesEqual,
+  cloneBytes,
+  decodeUtf8,
+  encodeUtf8,
+  normalizeVirtualPath,
+  toBytes,
+} from '../vfs/vfsHelpers';
+import {
+  computeCellByteSize,
+  computeTypeByteSize,
+  deserializeIntoPointer,
+  evalConstArrayLength,
+  serializeFromPointer,
+  type BinaryCodecContext,
+} from './binaryCodec';
+import {
+  C_SEEK_CUR,
+  C_SEEK_END,
+  C_SEEK_SET,
+  clearCFileErr,
+  createCFileHandle,
+  getCFileBytes,
+  parseFopenMode,
+  readCFileByte,
+  readCFileBytes,
+  readCFileFgets,
+  rewindCFile,
+  seekCFile,
+  ungetcCFile,
+  writeCFileByte,
+  writeCFileBytes,
+  type CFileHandle,
+} from './cFileTable';
 
 export { StreamAbortError as RuntimeAbortError } from './streams';
 export { CharStreamBuffer as InteractiveStdin } from './streams';
@@ -24,6 +59,8 @@ export const STRING_NPOS = 4294967295; // 0xFFFFFFFF (unsigned size_t(-1))
 export interface Cell {
   value: RuntimeVal;
   type: TypeSpec;
+  arrayLength?: number;
+  arrayElemType?: TypeSpec;
 }
 
 export interface CharVal {
@@ -103,7 +140,19 @@ export interface StreamVal {
   flags: StreamFormatFlags;
   filePath?: string;
   appendMode?: boolean;
+  openMode?: number;
+  isBinary?: boolean;
+  lastReadCount?: number;
+  rawBytes?: Uint8Array;
+  rawLength?: number;
+  rawReadPos?: number;
+  rawWritePos?: number;
   isOpen: boolean;
+}
+
+export interface CFileVal {
+  __kind: 'cfile';
+  handleId: number;
 }
 
 export interface IteratorVal {
@@ -168,6 +217,7 @@ export type RuntimeVal =
   | StructVal
   | ExceptionVal
   | StreamVal
+  | CFileVal
   | IteratorVal
   | MapIteratorVal
   | SetIteratorVal
@@ -231,6 +281,9 @@ function isException(v: RuntimeVal): v is ExceptionVal {
 }
 function isStream(v: RuntimeVal): v is StreamVal {
   return typeof v === 'object' && v !== null && '__kind' in v && v.__kind === 'stream';
+}
+function isCFile(v: RuntimeVal): v is CFileVal {
+  return typeof v === 'object' && v !== null && '__kind' in v && v.__kind === 'cfile';
 }
 function isIterator(v: RuntimeVal): v is IteratorVal {
   return typeof v === 'object' && v !== null && '__kind' in v && v.__kind === 'iterator';
@@ -332,22 +385,88 @@ export interface RunCallbacks {
   onStderr: (text: string) => void;
   stdin: CharStreamBuffer;
   signal: AbortSignal;
+  initialFiles?: Record<string, string | Uint8Array> | Map<string, string | Uint8Array>;
+  onVfsChange?: (event: VfsRuntimeChangeEvent) => void;
+  onVfsFinalSync?: (snapshot: Record<string, Uint8Array>) => void;
 }
+
+const IOS_APP = 1;
+const IOS_IN = 2;
+const IOS_OUT = 4;
+const IOS_TRUNC = 8;
+const IOS_BINARY = 16;
+const IOS_ATE = 32;
 
 const MAX_OUTPUT_BYTES = 256 * 1024;
 const MAX_CALL_DEPTH = 512;
 
 export async function runProgram(program: ProgramNode, callbacks: RunCallbacks): Promise<number> {
-  const { onStdout, onStderr, stdin, signal } = callbacks;
+  const { onStdout, onStderr, stdin, signal, initialFiles, onVfsChange, onVfsFinalSync } = callbacks;
 
   // Fresh, atomic per-run VM state (zero leakage across runs)
   const functions = new Map<string, FunctionDecl[]>();
   const structs = new Map<string, StructDecl>();
   const enumConsts = new Map<string, number>();
   const blocks = new Map<number, MemoryBlock>();
-  const virtualFs = new Map<string, string>();
+  const virtualFs = new Map<string, Uint8Array>();
+  const lastNotifiedFs = new Map<string, Uint8Array>();
+  const cFileHandles = new Map<number, CFileHandle>();
   const staticVars = new Map<string, Cell>();
 
+  // Mount initial files from Virtual Workspace into binary-safe runtime VFS (Uint8Array)
+  if (initialFiles) {
+    if (initialFiles instanceof Map) {
+      for (const [rawPath, content] of initialFiles.entries()) {
+        const norm = normalizeVirtualPath(rawPath);
+        if (norm) {
+          const bytes = toBytes(content);
+          virtualFs.set(norm, bytes);
+          lastNotifiedFs.set(norm, cloneBytes(bytes));
+        }
+      }
+    } else {
+      for (const [rawPath, content] of Object.entries(initialFiles)) {
+        const norm = normalizeVirtualPath(rawPath);
+        if (norm) {
+          const bytes = toBytes(content);
+          virtualFs.set(norm, bytes);
+          lastNotifiedFs.set(norm, cloneBytes(bytes));
+        }
+      }
+    }
+  }
+
+  const snapshotVirtualFs = (): Record<string, Uint8Array> => {
+    const out: Record<string, Uint8Array> = {};
+    for (const [path, bytes] of virtualFs.entries()) {
+      out[path] = cloneBytes(bytes);
+    }
+    return out;
+  };
+
+  const notifyVfsChange = (
+    path: string,
+    action: 'create' | 'modify' | 'delete',
+    bytes?: Uint8Array
+  ): void => {
+    if (action === 'delete') {
+      lastNotifiedFs.delete(path);
+    } else {
+      lastNotifiedFs.set(path, bytes ? cloneBytes(bytes) : new Uint8Array(0));
+    }
+    if (!onVfsChange) return;
+    onVfsChange({
+      path,
+      action,
+      bytes: bytes ? cloneBytes(bytes) : undefined,
+      content: bytes ? decodeUtf8(bytes) : undefined,
+      snapshot: snapshotVirtualFs(),
+    });
+  };
+
+  const codecCtx = (): BinaryCodecContext => ({ structs, blocks, enumConsts });
+
+  let nextCFileHandleId = 1;
   let nextBlockId = 1;
   let nextBaseAddr = 0x55a1400010;
   let outputBytes = 0;
@@ -514,15 +633,99 @@ export async function runProgram(program: ProgramNode, callbacks: RunCallbacks):
     };
   };
 
-  const openFileStream = (stream: StreamVal, filePath: string, modeBits?: number): void => {
+  const resolveCFileHandle = (val: RuntimeVal): CFileHandle | null => {
+    if (!isPtr(val) || val.blockId === 0) return null;
+    const blk = blocks.get(val.blockId);
+    if (!blk || blk.freed) return null;
+    const cell = blk.cells[val.offset];
+    if (!cell || !isCFile(cell.value)) return null;
+    return cFileHandles.get(cell.value.handleId) ?? null;
+  };
+
+  const flushCFileHandle = (handle: CFileHandle, emitNotification = true): void => {
+    if (handle.closed || !handle.canWrite) return;
+    const latestBytes = getCFileBytes(handle);
+    const existedNotified = lastNotifiedFs.has(handle.path);
+    const prevNotified = lastNotifiedFs.get(handle.path);
+    virtualFs.set(handle.path, latestBytes);
+    handle.dirty = false;
+    if (
+      emitNotification &&
+      (!existedNotified || !prevNotified || !bytesEqual(prevNotified, latestBytes))
+    ) {
+      notifyVfsChange(handle.path, existedNotified ? 'modify' : 'create', latestBytes);
+    }
+  };
+
+  const ensureStreamRawCapacity = (stream: StreamVal, needed: number): void => {
+    const cur = stream.rawBytes ?? new Uint8Array(64);
+    if (needed <= cur.byteLength) {
+      stream.rawBytes = cur;
+      return;
+    }
+    let nextCap = Math.max(64, cur.byteLength);
+    while (nextCap < needed) nextCap *= 2;
+    const nextBuf = new Uint8Array(nextCap);
+    nextBuf.set(cur.subarray(0, stream.rawLength ?? 0), 0);
+    stream.rawBytes = nextBuf;
+  };
+
+  const writeStreamRawBytes = (stream: StreamVal, data: Uint8Array): void => {
+    if (!stream.isOpen || data.byteLength === 0) return;
+    const len = stream.rawLength ?? 0;
+    const targetPos = stream.appendMode ? len : (stream.rawWritePos ?? len);
+    const endPos = targetPos + data.byteLength;
+    ensureStreamRawCapacity(stream, endPos);
+    const buf = stream.rawBytes!;
+    if (targetPos > len) {
+      buf.fill(0, len, targetPos);
+    }
+    buf.set(data, targetPos);
+    stream.rawWritePos = endPos;
+    stream.rawLength = Math.max(len, endPos);
+    if (stream.filePath) {
+      virtualFs.set(stream.filePath, buf.slice(0, stream.rawLength));
+    }
+  };
+
+  const openFileStream = (stream: StreamVal, rawFilePath: string, modeBits?: number): void => {
+    const filePath = normalizeVirtualPath(rawFilePath);
     stream.filePath = filePath;
-    const isAppend = modeBits !== undefined && (modeBits & 1) !== 0; // ios::app = 1
-    stream.appendMode = isAppend;
     stream.buffer.clear();
+    stream.lastReadCount = 0;
+
+    if (!filePath) {
+      stream.isOpen = false;
+      stream.buffer.failbit = true;
+      return;
+    }
+
+    const isBinary = modeBits !== undefined && (modeBits & IOS_BINARY) !== 0;
+    const isAte = modeBits !== undefined && (modeBits & IOS_ATE) !== 0;
+    stream.isBinary = isBinary;
 
     if (stream.streamKind === 'ifstream') {
+      const effectiveMode = (modeBits ?? 0) | IOS_IN;
+      stream.openMode = effectiveMode;
+      stream.appendMode = false;
       if (virtualFs.has(filePath)) {
-        stream.buffer.setContent(virtualFs.get(filePath)!);
+        const raw = virtualFs.get(filePath)!;
+        const text = decodeUtf8(raw);
+        stream.buffer.setContent(text);
+        if (isBinary) {
+          stream.rawBytes = cloneBytes(raw);
+          stream.rawLength = raw.byteLength;
+          stream.rawReadPos = isAte ? raw.byteLength : 0;
+          stream.rawWritePos = raw.byteLength;
+        } else {
+          stream.rawBytes = undefined;
+          stream.rawLength = undefined;
+          stream.rawReadPos = undefined;
+          stream.rawWritePos = undefined;
+          if (isAte) {
+            stream.buffer.setPos(text.length);
+          }
+        }
         stream.isOpen = true;
       } else {
         stream.isOpen = false;
@@ -532,35 +735,148 @@ export async function runProgram(program: ProgramNode, callbacks: RunCallbacks):
     }
 
     if (stream.streamKind === 'ofstream') {
-      const existing = isAppend ? (virtualFs.get(filePath) ?? '') : '';
-      stream.outBuf = existing;
-      virtualFs.set(filePath, existing);
+      const effectiveMode =
+        modeBits === undefined ? IOS_OUT | IOS_TRUNC : modeBits | IOS_OUT;
+      const isAppend = (effectiveMode & IOS_APP) !== 0;
+      const isTrunc =
+        (effectiveMode & IOS_TRUNC) !== 0 || (!isAppend && (effectiveMode & IOS_IN) === 0);
+      stream.openMode = effectiveMode;
+      stream.appendMode = isAppend;
+
+      const existed = virtualFs.has(filePath);
+      const prevBytes = virtualFs.get(filePath) ?? new Uint8Array(0);
+      const nextBytes = isAppend
+        ? cloneBytes(prevBytes)
+        : isTrunc
+          ? new Uint8Array(0)
+          : cloneBytes(prevBytes);
+
+      if (isBinary) {
+        const cap = Math.max(64, nextBytes.byteLength);
+        const buf = new Uint8Array(cap);
+        buf.set(nextBytes, 0);
+        stream.rawBytes = buf;
+        stream.rawLength = nextBytes.byteLength;
+        stream.rawReadPos = 0;
+        stream.rawWritePos = isAppend || isAte ? nextBytes.byteLength : 0;
+        stream.outBuf = '';
+      } else {
+        stream.rawBytes = undefined;
+        stream.rawLength = undefined;
+        stream.rawReadPos = undefined;
+        stream.rawWritePos = undefined;
+        stream.outBuf = decodeUtf8(nextBytes);
+      }
+
+      virtualFs.set(filePath, cloneBytes(nextBytes));
       stream.isOpen = true;
+      if (!existed) {
+        notifyVfsChange(filePath, 'create', nextBytes);
+      } else if (!bytesEqual(nextBytes, prevBytes)) {
+        notifyVfsChange(filePath, 'modify', nextBytes);
+      }
       return;
     }
 
     // fstream
-    const existing = virtualFs.get(filePath) ?? '';
-    stream.outBuf = existing;
-    stream.buffer.setContent(existing);
-    if (!virtualFs.has(filePath)) {
-      virtualFs.set(filePath, '');
+    const effectiveMode = modeBits === undefined ? IOS_IN | IOS_OUT : modeBits;
+    const hasIn = (effectiveMode & IOS_IN) !== 0;
+    const hasOut = (effectiveMode & IOS_OUT) !== 0;
+    const isAppend = (effectiveMode & IOS_APP) !== 0;
+    const isTrunc = (effectiveMode & IOS_TRUNC) !== 0;
+
+    stream.openMode = effectiveMode;
+    stream.appendMode = isAppend;
+
+    const existed = virtualFs.has(filePath);
+    const prevBytes = virtualFs.get(filePath) ?? new Uint8Array(0);
+
+    if (hasIn && !hasOut && !isAppend) {
+      if (!existed) {
+        stream.isOpen = false;
+        stream.buffer.failbit = true;
+        return;
+      }
+      const text = decodeUtf8(prevBytes);
+      stream.outBuf = text;
+      stream.buffer.setContent(text);
+      if (isBinary) {
+        stream.rawBytes = cloneBytes(prevBytes);
+        stream.rawLength = prevBytes.byteLength;
+        stream.rawReadPos = isAte ? prevBytes.byteLength : 0;
+        stream.rawWritePos = prevBytes.byteLength;
+      } else {
+        stream.rawBytes = undefined;
+        if (isAte) stream.buffer.setPos(text.length);
+      }
+      stream.isOpen = true;
+      return;
     }
+
+    if (hasIn && hasOut && !isTrunc && !isAppend && !existed) {
+      // Standard C++: ios::in | ios::out without ios::trunc or ios::app fails if file doesn't exist
+      stream.isOpen = false;
+      stream.buffer.failbit = true;
+      return;
+    }
+
+    const nextBytes =
+      isTrunc || (hasOut && !hasIn && !isAppend) ? new Uint8Array(0) : cloneBytes(prevBytes);
+    const nextText = decodeUtf8(nextBytes);
+    stream.outBuf = nextText;
+    stream.buffer.setContent(nextText);
+    if (isBinary) {
+      const cap = Math.max(64, nextBytes.byteLength);
+      const buf = new Uint8Array(cap);
+      buf.set(nextBytes, 0);
+      stream.rawBytes = buf;
+      stream.rawLength = nextBytes.byteLength;
+      stream.rawReadPos = isAte ? nextBytes.byteLength : 0;
+      stream.rawWritePos = isAppend || isAte ? nextBytes.byteLength : 0;
+    } else {
+      stream.rawBytes = undefined;
+      if (isAte) {
+        stream.buffer.setPos(nextText.length);
+      }
+    }
+    virtualFs.set(filePath, cloneBytes(nextBytes));
     stream.isOpen = true;
+    if (!existed) {
+      notifyVfsChange(filePath, 'create', nextBytes);
+    } else if (!bytesEqual(nextBytes, prevBytes)) {
+      notifyVfsChange(filePath, 'modify', nextBytes);
+    }
   };
 
-  const flushAndSyncFileStream = (stream: StreamVal): void => {
+  const flushAndSyncFileStream = (stream: StreamVal, emitNotification = true): void => {
     if (
       stream.isOpen &&
       stream.filePath &&
       (stream.streamKind === 'ofstream' || stream.streamKind === 'fstream')
     ) {
-      virtualFs.set(stream.filePath, stream.outBuf);
+      const canWrite =
+        stream.streamKind === 'ofstream' ||
+        stream.openMode === undefined ||
+        (stream.openMode & (IOS_OUT | IOS_APP)) !== 0;
+      if (!canWrite) return;
+      const latestBytes =
+        stream.isBinary && stream.rawBytes !== undefined
+          ? stream.rawBytes.slice(0, stream.rawLength ?? 0)
+          : encodeUtf8(stream.outBuf);
+      const existedNotified = lastNotifiedFs.has(stream.filePath);
+      const prevNotified = lastNotifiedFs.get(stream.filePath);
+      virtualFs.set(stream.filePath, latestBytes);
+      if (
+        emitNotification &&
+        (!existedNotified || !prevNotified || !bytesEqual(prevNotified, latestBytes))
+      ) {
+        notifyVfsChange(stream.filePath, existedNotified ? 'modify' : 'create', latestBytes);
+      }
     }
   };
 
   const closeFileStream = (stream: StreamVal): void => {
-    flushAndSyncFileStream(stream);
+    flushAndSyncFileStream(stream, true);
     stream.isOpen = false;
   };
 
@@ -584,15 +900,30 @@ export async function runProgram(program: ProgramNode, callbacks: RunCallbacks):
       return;
     }
     if (stream.streamKind === 'ofstream' || stream.streamKind === 'fstream') {
-      if (!stream.isOpen) {
+      if (
+        !stream.isOpen ||
+        (stream.streamKind === 'fstream' &&
+          stream.openMode !== undefined &&
+          (stream.openMode & (IOS_OUT | IOS_APP)) === 0)
+      ) {
         stream.buffer.failbit = true;
+        return;
+      }
+      if (stream.isBinary && stream.rawBytes !== undefined) {
+        writeStreamRawBytes(stream, encodeUtf8(text));
+        stream.outBuf += text;
+        if (stream.streamKind === 'fstream') {
+          stream.buffer.appendContent(text);
+        }
         return;
       }
       stream.outBuf += text;
       if (stream.streamKind === 'fstream') {
         stream.buffer.appendContent(text);
       }
-      flushAndSyncFileStream(stream);
+      if (stream.filePath) {
+        virtualFs.set(stream.filePath, encodeUtf8(stream.outBuf));
+      }
     }
   };
 
@@ -656,11 +987,56 @@ export async function runProgram(program: ProgramNode, callbacks: RunCallbacks):
       const decl = structs.get(type.base)!;
       const fields = new Map<string, Cell>();
       for (const f of decl.fields) {
-        fields.set(f.name, { type: f.type, value: defaultValueForType(f.type) });
+        if (f.arraySizes && f.arraySizes.length > 0) {
+          const length = Math.max(1, evalConstArrayLength(f.arraySizes[0], enumConsts));
+          const elemType: TypeSpec = { ...f.type };
+          const elemBytes = computeTypeByteSize(elemType, structs, enumConsts);
+          const cells: Cell[] = Array.from({ length }, () => ({
+            type: elemType,
+            value: defaultValueForType(elemType),
+          }));
+          const ptr = allocBlock(cells, elemBytes);
+          const arrType: TypeSpec = { ...elemType, pointerDepth: elemType.pointerDepth + 1 };
+          fields.set(f.name, {
+            type: arrType,
+            value: ptr,
+            arrayLength: length,
+            arrayElemType: elemType,
+          });
+        } else {
+          fields.set(f.name, { type: f.type, value: defaultValueForType(f.type) });
+        }
       }
       return { __kind: 'struct', structName: decl.name, fields } satisfies StructVal;
     }
     return 0;
+  };
+
+  const cloneCell = (cell: Cell): Cell => {
+    if (cell.arrayLength !== undefined && cell.arrayElemType !== undefined && isPtr(cell.value)) {
+      const srcPtr = cell.value;
+      const srcBlk = blocks.get(srcPtr.blockId);
+      const elemBytes = computeTypeByteSize(cell.arrayElemType, structs, enumConsts);
+      const clonedCells: Cell[] = Array.from({ length: cell.arrayLength }, (_, idx) => {
+        const srcCell = srcBlk?.cells[srcPtr.offset + idx];
+        return srcCell
+          ? cloneCell(srcCell)
+          : { type: cell.arrayElemType!, value: defaultValueForType(cell.arrayElemType!) };
+      });
+      const ptr = allocBlock(clonedCells, elemBytes);
+      return {
+        type: cell.type,
+        value: ptr,
+        arrayLength: cell.arrayLength,
+        arrayElemType: cell.arrayElemType,
+      };
+    }
+    return {
+      type: cell.type,
+      value: cloneVal(cell.value),
+      arrayLength: cell.arrayLength,
+      arrayElemType: cell.arrayElemType,
+    };
   };
 
   const cloneVal = (val: RuntimeVal): RuntimeVal => {
@@ -669,7 +1045,7 @@ export async function runProgram(program: ProgramNode, callbacks: RunCallbacks):
       return {
         __kind: 'vector',
         elemType: val.elemType,
-        cells: val.cells.map((c) => ({ type: c.type, value: cloneVal(c.value) })),
+        cells: val.cells.map((c) => cloneCell(c)),
       };
     }
     if (isMap(val)) {
@@ -677,7 +1053,7 @@ export async function runProgram(program: ProgramNode, callbacks: RunCallbacks):
       for (const [k, e] of val.entries.entries()) {
         entries.set(k, {
           key: cloneVal(e.key),
-          cell: { type: e.cell.type, value: cloneVal(e.cell.value) },
+          cell: cloneCell(e.cell),
         });
       }
       return { ...val, entries };
@@ -692,14 +1068,14 @@ export async function runProgram(program: ProgramNode, callbacks: RunCallbacks):
     if (isPair(val)) {
       return {
         __kind: 'pair',
-        first: { type: val.first.type, value: cloneVal(val.first.value) },
-        second: { type: val.second.type, value: cloneVal(val.second.value) },
+        first: cloneCell(val.first),
+        second: cloneCell(val.second),
       };
     }
     if (isStruct(val)) {
       const fields = new Map<string, Cell>();
       for (const [k, c] of val.fields.entries()) {
-        fields.set(k, { type: c.type, value: cloneVal(c.value) });
+        fields.set(k, cloneCell(c));
       }
       return { __kind: 'struct', structName: val.structName, fields };
     }
@@ -710,15 +1086,15 @@ export async function runProgram(program: ProgramNode, callbacks: RunCallbacks):
     if (type.base === 'auto') return cloneVal(val);
     if (type.pointerDepth > 0) {
       if (isPtr(val)) {
-        const targetElemSize = sizeOfType({ ...type, pointerDepth: type.pointerDepth - 1 });
+        const targetElemType: TypeSpec = { ...type, pointerDepth: type.pointerDepth - 1 };
+        const targetElemSize = computeTypeByteSize(targetElemType, structs, enumConsts);
         if (val.blockId !== 0 && val.elemSize !== targetElemSize) {
           const blk = blocks.get(val.blockId);
           if (blk && blk.elemSize === 1 && targetElemSize > 1) {
             const count = Math.max(1, Math.floor(blk.cells.length / targetElemSize));
-            const elemType: TypeSpec = { ...type, pointerDepth: type.pointerDepth - 1 };
             blk.cells = Array.from({ length: count }, () => ({
-              type: elemType,
-              value: defaultValueForType(elemType),
+              type: targetElemType,
+              value: defaultValueForType(targetElemType),
             }));
             blk.elemSize = targetElemSize;
             return { ...val, elemSize: targetElemSize };
@@ -798,7 +1174,17 @@ export async function runProgram(program: ProgramNode, callbacks: RunCallbacks):
     } else if (typeof val === 'string') {
       str = val;
     } else if (isPtr(val)) {
-      str = val.blockId === 0 ? '0' : `0x${(val.baseAddr + val.offset * val.elemSize).toString(16)}`;
+      if (val.blockId === 0) {
+        str = '0';
+      } else {
+        const blk = blocks.get(val.blockId);
+        const elemCell = blk && !blk.freed ? blk.cells[val.offset] : undefined;
+        if (elemCell && elemCell.type.base === 'char' && elemCell.type.pointerDepth === 0) {
+          str = readCStringFromVal(val);
+        } else {
+          str = `0x${(val.baseAddr + val.offset * val.elemSize).toString(16)}`;
+        }
+      }
     } else if (val === null || val === undefined) {
       str = '0';
     } else {
@@ -1446,7 +1832,32 @@ export async function runProgram(program: ProgramNode, callbacks: RunCallbacks):
     // Initialize any remaining fields with in-class defaults or zero-defaults
     for (const f of decl.fields) {
       if (initializedFields.has(f.name)) continue;
-      if (f.init) {
+      if (f.arraySizes && f.arraySizes.length > 0) {
+        const length = Math.max(1, evalConstArrayLength(f.arraySizes[0], enumConsts));
+        const elemType: TypeSpec = { ...f.type };
+        const elemBytes = computeTypeByteSize(elemType, structs, enumConsts);
+        const initVals: RuntimeVal[] = [];
+        if (f.init?.kind === 'init_list') {
+          for (const el of f.init.elements) {
+            initVals.push(coerceToType(await evalExpr(el, ctorScope), elemType));
+          }
+        } else if (f.init?.kind === 'string' && elemType.base === 'char') {
+          for (const ch of f.init.value) initVals.push(makeChar(ch));
+          initVals.push(makeChar('\0'));
+        }
+        const cells: Cell[] = Array.from({ length }, (_, idx) => ({
+          type: elemType,
+          value: idx < initVals.length ? initVals[idx] : defaultValueForType(elemType),
+        }));
+        const ptr = allocBlock(cells, elemBytes);
+        const arrType: TypeSpec = { ...elemType, pointerDepth: elemType.pointerDepth + 1 };
+        fields.set(f.name, {
+          type: arrType,
+          value: ptr,
+          arrayLength: length,
+          arrayElemType: elemType,
+        });
+      } else if (f.init) {
         const raw = await evalExpr(f.init, ctorScope);
         fields.set(f.name, { type: f.type, value: coerceToType(raw, f.type) });
       } else if (f.ctorArgs) {
@@ -1499,7 +1910,60 @@ export async function runProgram(program: ProgramNode, callbacks: RunCallbacks):
       return;
     }
 
-    // Fixed-size array declaration: `int a[5]` or `char buf[64]`
+    const initStructFromInitList = async (
+      decl: StructDecl,
+      elements: Expr[],
+      evalScope: Scope
+    ): Promise<StructVal> => {
+      if (decl.constructors.length > 0) {
+        return constructStruct(decl, elements, evalScope);
+      }
+      const structVal = await constructStruct(decl, [], evalScope);
+      const fieldEntries = Array.from(structVal.fields.values());
+      for (let k = 0; k < elements.length && k < fieldEntries.length; k += 1) {
+        const fieldCell = fieldEntries[k];
+        const elExpr = elements[k];
+        if (
+          fieldCell.arrayLength !== undefined &&
+          fieldCell.arrayElemType !== undefined &&
+          isPtr(fieldCell.value)
+        ) {
+          const blk = blocks.get(fieldCell.value.blockId);
+          if (blk) {
+            if (elExpr.kind === 'string' && fieldCell.arrayElemType.base === 'char') {
+              writeCStringToPtr(fieldCell.value, elExpr.value, fieldCell.arrayLength);
+            } else if (elExpr.kind === 'init_list') {
+              for (let j = 0; j < elExpr.elements.length && j < fieldCell.arrayLength; j += 1) {
+                blk.cells[j].value = coerceToType(
+                  await evalExpr(elExpr.elements[j], evalScope),
+                  fieldCell.arrayElemType
+                );
+              }
+            } else {
+              const val = await evalExpr(elExpr, evalScope);
+              if (typeof val === 'string' && fieldCell.arrayElemType.base === 'char') {
+                writeCStringToPtr(fieldCell.value, val, fieldCell.arrayLength);
+              }
+            }
+          }
+        } else if (
+          fieldCell.type.pointerDepth === 0 &&
+          structs.has(fieldCell.type.base) &&
+          elExpr.kind === 'init_list'
+        ) {
+          fieldCell.value = await initStructFromInitList(
+            structs.get(fieldCell.type.base)!,
+            elExpr.elements,
+            evalScope
+          );
+        } else {
+          fieldCell.value = coerceToType(await evalExpr(elExpr, evalScope), fieldCell.type);
+        }
+      }
+      return structVal;
+    };
+
+    // Fixed-size array declaration: `int a[5]`, `char buf[64]`, or `Record items[3]`
     if (item.arraySizes && item.arraySizes.length > 0) {
       let length = Math.trunc(toNumber(await evalExpr(item.arraySizes[0], scope)));
       const elemType: TypeSpec = { ...item.type };
@@ -1507,7 +1971,11 @@ export async function runProgram(program: ProgramNode, callbacks: RunCallbacks):
 
       if (item.init?.kind === 'init_list') {
         for (const el of item.init.elements) {
-          initVals.push(coerceToType(await evalExpr(el, scope), elemType));
+          if (elemType.pointerDepth === 0 && structs.has(elemType.base) && el.kind === 'init_list') {
+            initVals.push(await initStructFromInitList(structs.get(elemType.base)!, el.elements, scope));
+          } else {
+            initVals.push(coerceToType(await evalExpr(el, scope), elemType));
+          }
         }
       } else if (item.init?.kind === 'string' && elemType.base === 'char') {
         for (const ch of item.init.value) initVals.push(makeChar(ch));
@@ -1519,9 +1987,15 @@ export async function runProgram(program: ProgramNode, callbacks: RunCallbacks):
         type: elemType,
         value: idx < initVals.length ? initVals[idx] : defaultValueForType(elemType),
       }));
-      const ptr = allocBlock(cells, sizeOfType(elemType));
+      const elemBytes = computeTypeByteSize(elemType, structs, enumConsts);
+      const ptr = allocBlock(cells, elemBytes);
       const arrType: TypeSpec = { ...elemType, pointerDepth: elemType.pointerDepth + 1 };
-      const cell: Cell = { type: arrType, value: ptr };
+      const cell: Cell = {
+        type: arrType,
+        value: ptr,
+        arrayLength: length,
+        arrayElemType: elemType,
+      };
       scope.vars.set(item.name, cell);
       return;
     }
@@ -1632,18 +2106,7 @@ export async function runProgram(program: ProgramNode, callbacks: RunCallbacks):
       if (item.ctorArgs) {
         structVal = await constructStruct(decl, item.ctorArgs, scope);
       } else if (item.init?.kind === 'init_list') {
-        if (decl.constructors.length > 0) {
-          structVal = await constructStruct(decl, item.init.elements, scope);
-        } else {
-          structVal = await constructStruct(decl, [], scope);
-          const fieldEntries = Array.from(structVal.fields.values());
-          for (let k = 0; k < item.init.elements.length && k < fieldEntries.length; k++) {
-            fieldEntries[k].value = coerceToType(
-              await evalExpr(item.init.elements[k], scope),
-              fieldEntries[k].type
-            );
-          }
-        }
+        structVal = await initStructFromInitList(decl, item.init.elements, scope);
       } else if (item.init) {
         const raw = await evalExpr(item.init, scope);
         structVal = isStruct(raw) ? (cloneVal(raw) as StructVal) : await constructStruct(decl, [], scope);
@@ -1759,6 +2222,14 @@ export async function runProgram(program: ProgramNode, callbacks: RunCallbacks):
     if (name === 'fgets') {
       const dest = args[0] ? await evalExpr(args[0], scope) : NULL_PTR;
       const maxCount = args[1] ? Math.trunc(toNumber(await evalExpr(args[1], scope))) : 0;
+      const streamArg = args[2] ? await evalExpr(args[2], scope) : cinStream;
+      const handle = resolveCFileHandle(streamArg);
+      if (handle) {
+        const line = readCFileFgets(handle, maxCount);
+        if (line === null) return { handled: true, value: NULL_PTR };
+        if (isPtr(dest)) writeCStringToPtr(dest, line, maxCount);
+        return { handled: true, value: dest };
+      }
       const line = await cinStream.buffer.readFgets(maxCount, signal);
       if (line === null) return { handled: true, value: NULL_PTR };
       if (isPtr(dest)) writeCStringToPtr(dest, line, maxCount);
@@ -1766,7 +2237,294 @@ export async function runProgram(program: ProgramNode, callbacks: RunCallbacks):
     }
 
     if (name === 'fflush') {
+      const target = args[0] ? await evalExpr(args[0], scope) : NULL_PTR;
+      if (isPtr(target) && target.blockId === 0) {
+        for (const h of cFileHandles.values()) {
+          if (!h.closed && h.dirty) flushCFileHandle(h, true);
+        }
+        return { handled: true, value: 0 };
+      }
+      const handle = resolveCFileHandle(target);
+      if (handle) {
+        if (handle.closed) return { handled: true, value: -1 };
+        flushCFileHandle(handle, true);
+      }
       return { handled: true, value: 0 };
+    }
+
+    // C-style FILE* I/O (<cstdio> / <stdio.h>) over binary-safe Virtual FS
+    if (name === 'fopen') {
+      const rawPath = args[0] ? readCStringFromVal(await evalExpr(args[0], scope)) : '';
+      const rawMode = args[1] ? readCStringFromVal(await evalExpr(args[1], scope)) : '';
+      const filePath = normalizeVirtualPath(rawPath);
+      const parsed = parseFopenMode(rawMode);
+      if (!filePath || !parsed) {
+        return { handled: true, value: NULL_PTR };
+      }
+      const existed = virtualFs.has(filePath);
+      if (!parsed.createIfMissing && !existed) {
+        return { handled: true, value: NULL_PTR };
+      }
+      const prevBytes = virtualFs.get(filePath);
+      const handleId = nextCFileHandleId++;
+      const handle = createCFileHandle(handleId, filePath, rawMode, parsed, prevBytes);
+      cFileHandles.set(handleId, handle);
+      if (parsed.canWrite && (parsed.truncate || !existed)) {
+        const initialOut = getCFileBytes(handle);
+        virtualFs.set(filePath, initialOut);
+        if (!existed) {
+          notifyVfsChange(filePath, 'create', initialOut);
+        } else if (prevBytes && !bytesEqual(prevBytes, initialOut)) {
+          notifyVfsChange(filePath, 'modify', initialOut);
+        }
+      }
+      const filePtr = allocBlock(
+        [{ type: defaultType('FILE'), value: { __kind: 'cfile', handleId } satisfies CFileVal }],
+        8
+      );
+      return { handled: true, value: filePtr };
+    }
+
+    if (name === 'fclose') {
+      const streamArg = args[0] ? await evalExpr(args[0], scope) : NULL_PTR;
+      const handle = resolveCFileHandle(streamArg);
+      if (!handle || handle.closed) {
+        return { handled: true, value: -1 };
+      }
+      flushCFileHandle(handle, true);
+      handle.closed = true;
+      return { handled: true, value: 0 };
+    }
+
+    if (name === 'fwrite') {
+      const ptr = args[0] ? await evalExpr(args[0], scope) : NULL_PTR;
+      const size = args[1] ? Math.max(0, Math.trunc(toNumber(await evalExpr(args[1], scope)))) : 0;
+      const count = args[2] ? Math.max(0, Math.trunc(toNumber(await evalExpr(args[2], scope)))) : 0;
+      const streamArg = args[3] ? await evalExpr(args[3], scope) : NULL_PTR;
+      if (size === 0 || count === 0) return { handled: true, value: 0 };
+
+      const totalBytes = size * count;
+      const payload = serializeFromPointer(ptr, totalBytes, codecCtx());
+
+      if (isStream(streamArg) && (streamArg.streamKind === 'cout' || streamArg.streamKind === 'cerr')) {
+        emit(streamArg.streamKind === 'cerr' ? 'stderr' : 'stdout', decodeUtf8(payload));
+        return { handled: true, value: count };
+      }
+
+      const handle = resolveCFileHandle(streamArg);
+      if (!handle || handle.closed || !handle.canWrite) {
+        if (handle) handle.errorFlag = true;
+        return { handled: true, value: 0 };
+      }
+      const bytesWritten = writeCFileBytes(handle, payload);
+      return { handled: true, value: Math.floor(bytesWritten / size) };
+    }
+
+    if (name === 'fread') {
+      const ptr = args[0] ? await evalExpr(args[0], scope) : NULL_PTR;
+      const size = args[1] ? Math.max(0, Math.trunc(toNumber(await evalExpr(args[1], scope)))) : 0;
+      const count = args[2] ? Math.max(0, Math.trunc(toNumber(await evalExpr(args[2], scope)))) : 0;
+      const streamArg = args[3] ? await evalExpr(args[3], scope) : NULL_PTR;
+      if (size === 0 || count === 0) return { handled: true, value: 0 };
+
+      const handle = resolveCFileHandle(streamArg);
+      if (!handle || handle.closed || !handle.canRead) {
+        if (handle) handle.errorFlag = true;
+        return { handled: true, value: 0 };
+      }
+      const totalRequested = size * count;
+      const rawBytes = readCFileBytes(handle, totalRequested);
+      if (rawBytes.byteLength > 0) {
+        deserializeIntoPointer(ptr, rawBytes, codecCtx());
+      }
+      return { handled: true, value: Math.floor(rawBytes.byteLength / size) };
+    }
+
+    if (name === 'fprintf') {
+      const evalArgs: RuntimeVal[] = [];
+      for (const a of args) evalArgs.push(await evalExpr(a, scope));
+      const streamArg = evalArgs[0] ?? NULL_PTR;
+      const fmt = readCStringFromVal(evalArgs[1] ?? '');
+      const text = formatPrintf(fmt, evalArgs.slice(2));
+
+      if (isStream(streamArg)) {
+        if (streamArg.streamKind === 'cerr') emit('stderr', text);
+        else emit('stdout', text);
+        return { handled: true, value: text.length };
+      }
+      const handle = resolveCFileHandle(streamArg);
+      if (!handle || handle.closed || !handle.canWrite) {
+        if (handle) handle.errorFlag = true;
+        return { handled: true, value: -1 };
+      }
+      const encoded = encodeUtf8(text);
+      const written = writeCFileBytes(handle, encoded);
+      return { handled: true, value: written };
+    }
+
+    if (name === 'fscanf') {
+      const evalArgs: RuntimeVal[] = [];
+      for (const a of args) evalArgs.push(await evalExpr(a, scope));
+      const streamArg = evalArgs[0] ?? NULL_PTR;
+      const fmt = readCStringFromVal(evalArgs[1] ?? '');
+      const targets = evalArgs.slice(2);
+
+      if (isStream(streamArg) && streamArg.streamKind === 'cin') {
+        const matched = await executeScanfFromBuffer(cinStream.buffer, fmt, targets);
+        return { handled: true, value: matched };
+      }
+      const handle = resolveCFileHandle(streamArg);
+      if (!handle || handle.closed || !handle.canRead) {
+        if (handle) handle.errorFlag = true;
+        return { handled: true, value: -1 };
+      }
+      if (handle.pos >= handle.length) {
+        handle.eofFlag = true;
+        return { handled: true, value: -1 };
+      }
+      const remainingText = decodeUtf8(handle.buf.subarray(handle.pos, handle.length));
+      const tmpBuf = new CharStreamBuffer({ initial: remainingText, interactive: false });
+      const matched = await executeScanfFromBuffer(tmpBuf, fmt, targets);
+      const consumedText = remainingText.slice(0, tmpBuf.getPos());
+      const consumedBytes = encodeUtf8(consumedText).byteLength;
+      handle.pos = Math.min(handle.length, handle.pos + consumedBytes);
+      if (tmpBuf.eof() || (matched === -1 && handle.pos >= handle.length)) {
+        handle.eofFlag = true;
+      }
+      return { handled: true, value: matched };
+    }
+
+    if (name === 'fputs') {
+      const text = args[0] ? readCStringFromVal(await evalExpr(args[0], scope)) : '';
+      const streamArg = args[1] ? await evalExpr(args[1], scope) : coutStream;
+      if (isStream(streamArg)) {
+        emit(streamArg.streamKind === 'cerr' ? 'stderr' : 'stdout', text);
+        return { handled: true, value: text.length };
+      }
+      const handle = resolveCFileHandle(streamArg);
+      if (!handle || handle.closed || !handle.canWrite) {
+        if (handle) handle.errorFlag = true;
+        return { handled: true, value: -1 };
+      }
+      const encoded = encodeUtf8(text);
+      writeCFileBytes(handle, encoded);
+      return { handled: true, value: encoded.byteLength };
+    }
+
+    if (name === 'fgetc' || name === 'getc') {
+      const streamArg = args[0] ? await evalExpr(args[0], scope) : cinStream;
+      if (isStream(streamArg) && streamArg.streamKind === 'cin') {
+        const code = await cinStream.buffer.getCharCode(signal);
+        return { handled: true, value: code };
+      }
+      const handle = resolveCFileHandle(streamArg);
+      if (!handle) return { handled: true, value: -1 };
+      return { handled: true, value: readCFileByte(handle) };
+    }
+
+    if (name === 'fputc' || name === 'putc') {
+      const val = args[0] ? await evalExpr(args[0], scope) : 0;
+      const chCode = isChar(val)
+        ? val.code
+        : typeof val === 'string'
+          ? (val.charCodeAt(0) || 0) & 0xff
+          : Math.trunc(toNumber(val)) & 0xff;
+      const streamArg = args[1] ? await evalExpr(args[1], scope) : coutStream;
+      if (isStream(streamArg)) {
+        emit(streamArg.streamKind === 'cerr' ? 'stderr' : 'stdout', String.fromCharCode(chCode));
+        return { handled: true, value: chCode };
+      }
+      const handle = resolveCFileHandle(streamArg);
+      if (!handle) return { handled: true, value: -1 };
+      return { handled: true, value: writeCFileByte(handle, chCode) };
+    }
+
+    if (name === 'ungetc') {
+      const val = args[0] ? await evalExpr(args[0], scope) : -1;
+      const chCode = isChar(val) ? val.code : Math.trunc(toNumber(val));
+      const streamArg = args[1] ? await evalExpr(args[1], scope) : NULL_PTR;
+      const handle = resolveCFileHandle(streamArg);
+      if (!handle) return { handled: true, value: -1 };
+      return { handled: true, value: ungetcCFile(handle, chCode) };
+    }
+
+    if (name === 'feof') {
+      const streamArg = args[0] ? await evalExpr(args[0], scope) : NULL_PTR;
+      if (isStream(streamArg)) return { handled: true, value: streamArg.buffer.eof() ? 1 : 0 };
+      const handle = resolveCFileHandle(streamArg);
+      return { handled: true, value: handle?.eofFlag ? 1 : 0 };
+    }
+
+    if (name === 'ferror') {
+      const streamArg = args[0] ? await evalExpr(args[0], scope) : NULL_PTR;
+      if (isStream(streamArg)) return { handled: true, value: streamArg.buffer.bad() ? 1 : 0 };
+      const handle = resolveCFileHandle(streamArg);
+      return { handled: true, value: handle?.errorFlag ? 1 : 0 };
+    }
+
+    if (name === 'clearerr') {
+      const streamArg = args[0] ? await evalExpr(args[0], scope) : NULL_PTR;
+      if (isStream(streamArg)) {
+        streamArg.buffer.clear();
+        return { handled: true, value: undefined };
+      }
+      const handle = resolveCFileHandle(streamArg);
+      if (handle) clearCFileErr(handle);
+      return { handled: true, value: undefined };
+    }
+
+    if (name === 'rewind') {
+      const streamArg = args[0] ? await evalExpr(args[0], scope) : NULL_PTR;
+      const handle = resolveCFileHandle(streamArg);
+      if (handle) rewindCFile(handle);
+      return { handled: true, value: undefined };
+    }
+
+    if (name === 'fseek') {
+      const streamArg = args[0] ? await evalExpr(args[0], scope) : NULL_PTR;
+      const offset = args[1] ? Math.trunc(toNumber(await evalExpr(args[1], scope))) : 0;
+      const origin = args[2] ? Math.trunc(toNumber(await evalExpr(args[2], scope))) : C_SEEK_SET;
+      const handle = resolveCFileHandle(streamArg);
+      if (!handle) return { handled: true, value: -1 };
+      return { handled: true, value: seekCFile(handle, offset, origin) };
+    }
+
+    if (name === 'ftell') {
+      const streamArg = args[0] ? await evalExpr(args[0], scope) : NULL_PTR;
+      const handle = resolveCFileHandle(streamArg);
+      if (!handle || handle.closed) return { handled: true, value: -1 };
+      return { handled: true, value: handle.pos };
+    }
+
+    // <cstdio> file management over Virtual FS
+    if (name === 'remove') {
+      const targetPath = args[0]
+        ? normalizeVirtualPath(readCStringFromVal(await evalExpr(args[0], scope)))
+        : '';
+      if (targetPath && virtualFs.has(targetPath)) {
+        virtualFs.delete(targetPath);
+        notifyVfsChange(targetPath, 'delete');
+        return { handled: true, value: 0 };
+      }
+      return { handled: true, value: -1 };
+    }
+
+    if (name === 'rename') {
+      const oldPath = args[0]
+        ? normalizeVirtualPath(readCStringFromVal(await evalExpr(args[0], scope)))
+        : '';
+      const newPath = args[1]
+        ? normalizeVirtualPath(readCStringFromVal(await evalExpr(args[1], scope)))
+        : '';
+      if (oldPath && newPath && virtualFs.has(oldPath)) {
+        const rawBytes = virtualFs.get(oldPath)!;
+        virtualFs.delete(oldPath);
+        virtualFs.set(newPath, rawBytes);
+        notifyVfsChange(oldPath, 'delete');
+        notifyVfsChange(newPath, 'create', rawBytes);
+        return { handled: true, value: 0 };
+      }
+      return { handled: true, value: -1 };
     }
 
     // C++ std::getline(stream, str, delim?)
@@ -2230,11 +2988,57 @@ export async function runProgram(program: ProgramNode, callbacks: RunCallbacks):
         if (expr.name === 'stdout') return coutStream;
         if (expr.name === 'stderr') return cerrStream;
         if (expr.name === 'EOF') return -1;
+        if (expr.name === 'SEEK_SET') return C_SEEK_SET;
+        if (expr.name === 'SEEK_CUR') return C_SEEK_CUR;
+        if (expr.name === 'SEEK_END') return C_SEEK_END;
         if (expr.name === 'string::npos' || expr.name === 'npos') return STRING_NPOS;
-        if (expr.name === 'ios::app' || expr.name === 'ios_base::app') return 1;
-        if (expr.name === 'ios::in' || expr.name === 'ios_base::in') return 2;
-        if (expr.name === 'ios::out' || expr.name === 'ios_base::out') return 4;
-        if (expr.name === 'ios::trunc' || expr.name === 'ios_base::trunc') return 8;
+        if (
+          expr.name === 'ios::app' ||
+          expr.name === 'ios_base::app' ||
+          expr.name === 'ofstream::app' ||
+          expr.name === 'fstream::app'
+        )
+          return IOS_APP;
+        if (
+          expr.name === 'ios::in' ||
+          expr.name === 'ios_base::in' ||
+          expr.name === 'ifstream::in' ||
+          expr.name === 'fstream::in'
+        )
+          return IOS_IN;
+        if (
+          expr.name === 'ios::out' ||
+          expr.name === 'ios_base::out' ||
+          expr.name === 'ofstream::out' ||
+          expr.name === 'fstream::out'
+        )
+          return IOS_OUT;
+        if (
+          expr.name === 'ios::trunc' ||
+          expr.name === 'ios_base::trunc' ||
+          expr.name === 'ofstream::trunc' ||
+          expr.name === 'fstream::trunc'
+        )
+          return IOS_TRUNC;
+        if (
+          expr.name === 'ios::binary' ||
+          expr.name === 'ios_base::binary' ||
+          expr.name === 'ifstream::binary' ||
+          expr.name === 'ofstream::binary' ||
+          expr.name === 'fstream::binary'
+        )
+          return IOS_BINARY;
+        if (
+          expr.name === 'ios::ate' ||
+          expr.name === 'ios_base::ate' ||
+          expr.name === 'ifstream::ate' ||
+          expr.name === 'ofstream::ate' ||
+          expr.name === 'fstream::ate'
+        )
+          return IOS_ATE;
+        if (expr.name === 'ios::beg' || expr.name === 'ios_base::beg') return 0;
+        if (expr.name === 'ios::cur' || expr.name === 'ios_base::cur') return 1;
+        if (expr.name === 'ios::end' || expr.name === 'ios_base::end') return 2;
 
         // Stream manipulators
         if (
@@ -2263,12 +3067,48 @@ export async function runProgram(program: ProgramNode, callbacks: RunCallbacks):
       }
 
       case 'sizeof': {
-        if (expr.targetType) return sizeOfType(expr.targetType);
+        if (expr.targetType) {
+          if (
+            expr.targetType.pointerDepth === 0 &&
+            (!expr.targetType.templateArgs || expr.targetType.templateArgs.length === 0) &&
+            !expr.targetType.isConst &&
+            !expr.targetType.isUnsigned &&
+            !expr.targetType.isRef
+          ) {
+            const shadowed = lookupCell(scope, expr.targetType.base);
+            if (shadowed) {
+              return computeCellByteSize(shadowed.cell, structs, enumConsts);
+            }
+          }
+          return computeTypeByteSize(expr.targetType, structs, enumConsts);
+        }
         if (expr.expr) {
+          if (expr.expr.kind === 'ident') {
+            const found = lookupCell(scope, expr.expr.name);
+            if (found) {
+              return computeCellByteSize(found.cell, structs, enumConsts);
+            }
+          }
+          if (expr.expr.kind === 'member' || expr.expr.kind === 'index') {
+            try {
+              const lv = await resolveLValue(expr.expr, scope);
+              return computeCellByteSize(lv.cell, structs, enumConsts);
+            } catch {
+              // Fall back to evaluating expression value below
+            }
+          }
+          if (expr.expr.kind === 'string') {
+            return encodeUtf8(expr.expr.value).byteLength + 1;
+          }
           const val = await evalExpr(expr.expr, scope);
+          if (isStruct(val)) {
+            return computeTypeByteSize(defaultType(val.structName), structs, enumConsts);
+          }
           if (isPtr(val)) return 8;
           if (isChar(val)) return 1;
-          if (typeof val === 'string') return val.length + 1;
+          if (typeof val === 'boolean') return 1;
+          if (typeof val === 'string') return encodeUtf8(val).byteLength + 1;
+          if (typeof val === 'number' && !Number.isInteger(val)) return 8;
           return 4;
         }
         return 4;
@@ -2280,7 +3120,7 @@ export async function runProgram(program: ProgramNode, callbacks: RunCallbacks):
       }
 
       case 'new': {
-        const elemSize = sizeOfType(expr.allocType);
+        const elemSize = computeTypeByteSize(expr.allocType, structs, enumConsts);
         if (expr.count) {
           const count = Math.max(0, Math.trunc(toNumber(await evalExpr(expr.count, scope))));
           const cells: Cell[] = Array.from({ length: count }, () => ({
@@ -2541,6 +3381,106 @@ export async function runProgram(program: ProgramNode, callbacks: RunCallbacks):
               const v = await evalExpr(expr.args[0], scope);
               const ch = isChar(v) ? v.ch : String.fromCharCode(Math.trunc(toNumber(v)) & 0xff);
               writeToOutputStream(target, ch);
+              return target;
+            }
+            if (method === 'write') {
+              const src = expr.args[0] ? await evalExpr(expr.args[0], scope) : NULL_PTR;
+              const count = expr.args[1]
+                ? Math.max(0, Math.trunc(toNumber(await evalExpr(expr.args[1], scope))))
+                : 0;
+              if (count === 0) return target;
+              const rawBytes = serializeFromPointer(src, count, codecCtx());
+              if (target.isBinary && target.rawBytes !== undefined) {
+                writeStreamRawBytes(target, rawBytes);
+              } else {
+                writeToOutputStream(target, decodeUtf8(rawBytes));
+              }
+              return target;
+            }
+            if (method === 'read') {
+              const dest = expr.args[0] ? await evalExpr(expr.args[0], scope) : NULL_PTR;
+              const count = expr.args[1]
+                ? Math.max(0, Math.trunc(toNumber(await evalExpr(expr.args[1], scope))))
+                : 0;
+              if (target.isBinary && target.rawBytes !== undefined) {
+                const pos = target.rawReadPos ?? 0;
+                const len = target.rawLength ?? 0;
+                const avail = Math.max(0, len - pos);
+                const actual = Math.min(avail, count);
+                const slice = target.rawBytes.subarray(pos, pos + actual);
+                target.rawReadPos = pos + actual;
+                target.lastReadCount = actual;
+                if (actual > 0) {
+                  deserializeIntoPointer(dest, slice, codecCtx());
+                }
+                if (actual < count) {
+                  target.buffer.eofbit = true;
+                  target.buffer.failbit = true;
+                }
+                return target;
+              }
+              const raw = target.buffer.readRawChars(count);
+              target.lastReadCount = raw.length;
+              if (raw.length > 0) {
+                deserializeIntoPointer(dest, encodeUtf8(raw), codecCtx());
+              }
+              return target;
+            }
+            if (method === 'gcount') {
+              return target.lastReadCount ?? 0;
+            }
+            if (method === 'tellg') {
+              if (!target.isOpen) return -1;
+              if (target.isBinary && target.rawBytes !== undefined) {
+                return target.rawReadPos ?? 0;
+              }
+              return target.buffer.getPos();
+            }
+            if (method === 'tellp') {
+              if (!target.isOpen) return -1;
+              if (target.isBinary && target.rawBytes !== undefined) {
+                return target.rawWritePos ?? target.rawLength ?? 0;
+              }
+              return target.outBuf.length;
+            }
+            if (method === 'seekg') {
+              const offsetVal = expr.args[0]
+                ? Math.trunc(toNumber(await evalExpr(expr.args[0], scope)))
+                : 0;
+              const dir = expr.args[1]
+                ? Math.trunc(toNumber(await evalExpr(expr.args[1], scope)))
+                : 0;
+              if (target.isBinary && target.rawBytes !== undefined) {
+                const len = target.rawLength ?? 0;
+                const cur = target.rawReadPos ?? 0;
+                const nextPos = dir === 1 ? cur + offsetVal : dir === 2 ? len + offsetVal : offsetVal;
+                target.rawReadPos = Math.max(0, Math.min(len, nextPos));
+                target.buffer.eofbit = false;
+                return target;
+              }
+              const contentLen = target.buffer.getContent().length;
+              const nextPos =
+                dir === 1
+                  ? target.buffer.getPos() + offsetVal
+                  : dir === 2
+                    ? contentLen + offsetVal
+                    : offsetVal;
+              target.buffer.setPos(nextPos);
+              return target;
+            }
+            if (method === 'seekp') {
+              const offsetVal = expr.args[0]
+                ? Math.trunc(toNumber(await evalExpr(expr.args[0], scope)))
+                : 0;
+              const dir = expr.args[1]
+                ? Math.trunc(toNumber(await evalExpr(expr.args[1], scope)))
+                : 0;
+              if (target.isBinary && target.rawBytes !== undefined) {
+                const len = target.rawLength ?? 0;
+                const cur = target.rawWritePos ?? len;
+                const nextPos = dir === 1 ? cur + offsetVal : dir === 2 ? len + offsetVal : offsetVal;
+                target.rawWritePos = Math.max(0, nextPos);
+              }
               return target;
             }
             if (method === 'tie') {
@@ -3421,5 +4361,11 @@ export async function runProgram(program: ProgramNode, callbacks: RunCallbacks):
     throw err;
   } finally {
     await destroyScope(globalScope);
+    for (const handle of cFileHandles.values()) {
+      if (!handle.closed && handle.dirty) {
+        flushCFileHandle(handle, true);
+      }
+    }
+    onVfsFinalSync?.(snapshotVirtualFs());
   }
 }

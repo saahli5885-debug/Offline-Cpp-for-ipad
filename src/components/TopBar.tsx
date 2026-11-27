@@ -6,6 +6,7 @@ import {
   ChevronDown,
   Columns2,
   Download,
+  FolderOpen,
   Keyboard,
   Loader2,
   Minus,
@@ -69,6 +70,10 @@ interface TopBarProps {
   layoutPreference: LayoutPreference;
   effectiveLayout: EffectiveLayout;
   templates: CodeTemplate[];
+  sidebarOpen: boolean;
+  fileCount: number;
+  recentChangeCount: number;
+  onToggleSidebar: () => void;
   onChangeLanguage: (lang: Language) => void;
   onChangeStandard: (std: CompilerStandard) => void;
   onSelectTemplate: (template: CodeTemplate) => void;
@@ -79,7 +84,7 @@ interface TopBarProps {
   onChangeFontSize: (delta: number) => void;
   onSelectLayout: (layout: LayoutPreference) => void;
   onDownloadCode: () => void;
-  onImportCode: (content: string, detectedLang?: Language) => void;
+  onImportFiles: (files: FileList) => void;
   onOpenShortcuts: () => void;
   offlineReady: boolean;
   isOnline: boolean;
@@ -101,6 +106,10 @@ export function TopBar({
   layoutPreference,
   effectiveLayout,
   templates,
+  sidebarOpen,
+  fileCount,
+  recentChangeCount,
+  onToggleSidebar,
   onChangeLanguage,
   onChangeStandard,
   onSelectTemplate,
@@ -111,7 +120,7 @@ export function TopBar({
   onChangeFontSize,
   onSelectLayout,
   onDownloadCode,
-  onImportCode,
+  onImportFiles,
   onOpenShortcuts,
   offlineReady,
   isOnline,
@@ -179,28 +188,46 @@ export function TopBar({
           : 'Раскладка: Вкладки (Код / Консоль)';
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      const text = typeof reader.result === 'string' ? reader.result : '';
-      const lower = file.name.toLowerCase();
-      const detectedLang: Language | undefined = lower.endsWith('.c')
-        ? 'c'
-        : lower.endsWith('.cpp') || lower.endsWith('.cc') || lower.endsWith('.cxx')
-          ? 'cpp'
-          : undefined;
-      onImportCode(text, detectedLang);
-    };
-    reader.readAsText(file);
+    if (e.target.files && e.target.files.length > 0) {
+      onImportFiles(e.target.files);
+    }
     e.target.value = '';
   };
 
   return (
-    <header className="flex h-12 sm:h-13 shrink-0 items-center justify-between gap-2 sm:gap-3 border-b border-[var(--app-border)] bg-[var(--app-surface)] px-2.5 sm:px-4">
-      {/* Left zone: Brand + Language switch + Standard */}
-      <div className="flex min-w-0 items-center gap-2 sm:gap-3">
-        <span className="text-sm font-bold tracking-tight text-[var(--app-text)] whitespace-nowrap shrink-0">
+    <header className="flex h-13 shrink-0 items-center justify-between gap-2 sm:gap-3 border-b border-[var(--app-border)] bg-[var(--app-surface)] px-2 sm:px-3.5">
+      {/* Left zone: Files drawer toggle + Brand + Language switch + Standard */}
+      <div className="flex min-w-0 items-center gap-1.5 sm:gap-2.5">
+        <button
+          type="button"
+          data-testid="toggle-files-button"
+          onClick={onToggleSidebar}
+          aria-expanded={sidebarOpen}
+          aria-controls="workspace-sidebar"
+          aria-label={sidebarOpen ? 'Скрыть файлы рабочей области' : 'Открыть файлы рабочей области'}
+          title="Файлы рабочей области"
+          className={`relative inline-flex h-11 min-w-[44px] shrink-0 items-center justify-center gap-1.5 rounded-lg border px-2 sm:px-2.5 text-xs font-semibold transition-colors whitespace-nowrap ${
+            sidebarOpen
+              ? 'border-[var(--app-accent)]/60 bg-[var(--app-accent-soft)] text-[var(--app-text)]'
+              : 'border-[var(--app-border-strong)] bg-[var(--app-elevated)] text-[var(--app-text-secondary)] hover:bg-[var(--app-hover)] hover:text-[var(--app-text)]'
+          }`}
+        >
+          <FolderOpen className="h-4 w-4 shrink-0" />
+          <span className="hidden sm:inline">Файлы</span>
+          <span className="hidden min-[560px]:inline font-mono text-[11px] opacity-75 tabular-nums">
+            {fileCount}
+          </span>
+          {recentChangeCount > 0 && (
+            <span
+              aria-label={`Изменено файлов: ${recentChangeCount}`}
+              className="absolute -right-1 -top-1 flex h-4 min-w-[16px] items-center justify-center rounded-full bg-emerald-500 px-1 font-mono text-[10px] font-bold text-white tabular-nums shadow-xs"
+            >
+              {recentChangeCount}
+            </span>
+          )}
+        </button>
+
+        <span className="hidden min-[430px]:inline text-sm font-bold tracking-tight text-[var(--app-text)] whitespace-nowrap shrink-0">
           C++ Studio
         </span>
 
@@ -389,24 +416,24 @@ export function TopBar({
           <Keyboard className="h-4 w-4" />
         </button>
 
-        {/* Open file button on >= xl */}
+        {/* Open / import files button on >= xl */}
         <button
           type="button"
           onClick={() => fileInputRef.current?.click()}
-          aria-label="Открыть файл с кодом"
-          title="Открыть файл (.cpp / .c)"
-          className="hidden xl:inline-flex h-8 w-8 items-center justify-center rounded-lg border border-[var(--app-border-strong)] bg-[var(--app-elevated)] text-[var(--app-text-secondary)] transition-colors hover:bg-[var(--app-hover)] hover:text-[var(--app-text)] shrink-0"
+          aria-label="Импорт файлов в рабочую область"
+          title="Импорт из Файлов (.cpp, .h, .txt, .csv, .dat)"
+          className="hidden xl:inline-flex h-9 w-9 items-center justify-center rounded-lg border border-[var(--app-border-strong)] bg-[var(--app-elevated)] text-[var(--app-text-secondary)] transition-colors hover:bg-[var(--app-hover)] hover:text-[var(--app-text)] shrink-0"
         >
           <Upload className="h-4 w-4" />
         </button>
 
-        {/* Download file button on >= xl */}
+        {/* Download active file button on >= xl */}
         <button
           type="button"
           onClick={onDownloadCode}
-          aria-label="Скачать файл с кодом"
-          title="Скачать файл (⌘S)"
-          className="hidden xl:inline-flex h-8 w-8 items-center justify-center rounded-lg border border-[var(--app-border-strong)] bg-[var(--app-elevated)] text-[var(--app-text-secondary)] transition-colors hover:bg-[var(--app-hover)] hover:text-[var(--app-text)] shrink-0"
+          aria-label="Сохранить текущий файл"
+          title="Сохранить файл (⌘S)"
+          className="hidden xl:inline-flex h-9 w-9 items-center justify-center rounded-lg border border-[var(--app-border-strong)] bg-[var(--app-elevated)] text-[var(--app-text-secondary)] transition-colors hover:bg-[var(--app-hover)] hover:text-[var(--app-text)] shrink-0"
         >
           <Download className="h-4 w-4" />
         </button>
@@ -626,7 +653,7 @@ export function TopBar({
                 className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-xs font-medium text-[var(--app-text)] hover:bg-[var(--app-hover)]"
               >
                 <Upload className="h-3.5 w-3.5 text-[var(--app-text-secondary)]" />
-                <span>Открыть файл (.cpp / .c)</span>
+                <span>Импорт из Файлов</span>
               </button>
 
               <button
@@ -639,7 +666,7 @@ export function TopBar({
                 className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-xs font-medium text-[var(--app-text)] hover:bg-[var(--app-hover)]"
               >
                 <Download className="h-3.5 w-3.5 text-[var(--app-text-secondary)]" />
-                <span>Скачать код (⌘S)</span>
+                <span>Сохранить файл (⌘S)</span>
               </button>
 
               <button
@@ -728,18 +755,19 @@ export function TopBar({
         <input
           ref={fileInputRef}
           type="file"
-          accept=".cpp,.cc,.cxx,.c,.h,.hpp,.txt"
+          multiple
+          accept=".txt,.cpp,.cc,.cxx,.c,.h,.hpp,.hh,.csv,.dat,.bin,.json,.md"
           onChange={handleFileChange}
           className="hidden"
           aria-hidden="true"
         />
 
-        {/* Single primary CTA: Запустить / Остановить */}
+        {/* Single primary CTA: Запустить / Остановить (>= 44px touch height for iPadOS) */}
         {status === 'running' ? (
           <button
             type="button"
             onClick={onStop}
-            className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-rose-600 px-3 sm:px-3.5 text-xs font-semibold text-white transition-colors hover:bg-rose-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-rose-500 whitespace-nowrap shrink-0"
+            className="inline-flex h-11 min-w-[44px] items-center gap-1.5 rounded-lg bg-rose-600 px-3 sm:px-3.5 text-xs font-semibold text-white transition-colors hover:bg-rose-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-rose-500 whitespace-nowrap shrink-0"
           >
             <Square className="h-3 w-3 fill-current" />
             <span>Остановить</span>
@@ -749,7 +777,7 @@ export function TopBar({
             type="button"
             onClick={onRun}
             disabled={isBusy}
-            className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-[var(--app-accent)] px-3 sm:px-3.5 text-xs font-semibold text-white transition-colors hover:bg-[var(--app-accent-hover)] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--app-accent)] disabled:opacity-65 whitespace-nowrap shrink-0"
+            className="inline-flex h-11 min-w-[44px] items-center gap-1.5 rounded-lg bg-[var(--app-accent)] px-3 sm:px-3.5 text-xs font-semibold text-white transition-colors hover:bg-[var(--app-accent-hover)] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--app-accent)] disabled:opacity-65 whitespace-nowrap shrink-0"
           >
             {status === 'compiling' ? (
               <Loader2 className="h-3.5 w-3.5 animate-spin" />

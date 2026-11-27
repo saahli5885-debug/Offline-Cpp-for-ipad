@@ -1,4 +1,5 @@
 import type { CompilerDiagnostic, Language } from '../types/compiler';
+import type { VfsRuntimeChangeEvent } from '../vfs/types';
 import { CompileError, tokenizeCpp } from './lexer';
 import { parseCpp, type ProgramNode } from './parser';
 import { InteractiveStdin, runProgram, RuntimeAbortError } from './interpreter';
@@ -16,11 +17,19 @@ export interface BrowserSessionCallbacks {
   onStdout: (text: string) => void;
   onStderr: (text: string) => void;
   onWaitingForInput?: () => void;
+  initialFiles?: Record<string, string | Uint8Array> | Map<string, string | Uint8Array>;
+  onVfsChange?: (event: VfsRuntimeChangeEvent) => void;
+  onVfsFinalSync?: (snapshot: Record<string, Uint8Array>) => void;
   onExit: (result: { code: number | null; durationMs: number; reason?: string }) => void;
 }
 
-export function compileInBrowser(code: string, language: Language): BrowserCompileResult {
-  const fileName = language === 'cpp' ? 'main.cpp' : 'main.c';
+export function compileInBrowser(
+  code: string,
+  language: Language,
+  virtualFiles?: Readonly<Record<string, string>>,
+  entryFileName?: string
+): BrowserCompileResult {
+  const fileName = entryFileName ?? (language === 'cpp' ? 'main.cpp' : 'main.c');
   const startedAt = performance.now();
 
   if (!code.trim()) {
@@ -41,7 +50,7 @@ export function compileInBrowser(code: string, language: Language): BrowserCompi
   }
 
   try {
-    const lex = tokenizeCpp(code, fileName);
+    const lex = tokenizeCpp(code, fileName, 0, virtualFiles);
     const program = parseCpp(lex, fileName);
 
     const hasMain = program.declarations.some(
@@ -123,6 +132,9 @@ export class BrowserCppSession {
       onStderr: callbacks.onStderr,
       stdin: this.stdin,
       signal: this.controller.signal,
+      initialFiles: callbacks.initialFiles,
+      onVfsChange: callbacks.onVfsChange,
+      onVfsFinalSync: callbacks.onVfsFinalSync,
     })
       .then((exitCode) => {
         if (this.finished) return;

@@ -533,4 +533,27 @@ export class CharStreamBuffer {
       }
     }
   }
+
+  getPos(): number {
+    return this.pos;
+  }
+
+  setPos(nextPos: number): void {
+    const clamped = Math.max(0, Math.min(Math.trunc(nextPos), this.buffer.length));
+    this.pos = clamped;
+    this.eofbit = false;
+  }
+
+  readRawChars(count: number): string {
+    if (this.fail() || count <= 0) return '';
+    const available = Math.max(0, this.buffer.length - this.pos);
+    const take = Math.min(count, available);
+    const slice = this.buffer.slice(this.pos, this.pos + take);
+    this.pos += take;
+    if (take < count) {
+      this.eofbit = true;
+      this.failbit = true;
+    }
+    return slice;
+  }
 }

@@ -1,4 +1,5 @@
 import type { CompilerDiagnostic } from '../types/compiler';
+import { normalizeVirtualPath } from '../vfs/vfsHelpers';
 
 export type TokenType =
   | 'keyword'
@@ -99,12 +100,19 @@ export interface LexResult {
   sourceLines: string[];
 }
 
-export function tokenizeCpp(source: string, fileName: string, macroDepth = 0): LexResult {
+export function tokenizeCpp(
+  source: string,
+  fileName: string,
+  macroDepth = 0,
+  virtualFiles?: Readonly<Record<string, string>>,
+  includedGuard?: Set<string>
+): LexResult {
   const normalized = source.replace(/\r\n/g, '\n');
   const sourceLines = normalized.split('\n');
   const tokens: Token[] = [];
   const includes: string[] = [];
   const defines = new Map<string, string>();
+  const guard = includedGuard ?? new Set<string>([normalizeVirtualPath(fileName)]);
 
   let i = 0;
   let line = 1;
@@ -171,9 +179,35 @@ export function tokenizeCpp(source: string, fileName: string, macroDepth = 0): L
         }
         directive += advance();
       }
-      const incMatch = directive.match(/^#\s*include\s*[<"]([^>"]+)[>"]/);
+      const incMatch = directive.match(/^#\s*include\s*([<"])([^>"]+)[>"]/);
       if (incMatch) {
-        includes.push(incMatch[1]);
+        const delim = incMatch[1];
+        const headerRaw = incMatch[2];
+        includes.push(headerRaw);
+        if (delim === '"' && virtualFiles && macroDepth < 8) {
+          const normHeader = normalizeVirtualPath(headerRaw);
+          if (normHeader && Object.prototype.hasOwnProperty.call(virtualFiles, normHeader) && !guard.has(normHeader)) {
+            guard.add(normHeader);
+            const subLex = tokenizeCpp(
+              virtualFiles[normHeader],
+              normHeader,
+              macroDepth + 1,
+              virtualFiles,
+              guard
+            );
+            for (const subInc of subLex.includes) {
+              includes.push(subInc);
+            }
+            for (const [k, v] of subLex.defines.entries()) {
+              defines.set(k, v);
+            }
+            for (const t of subLex.tokens) {
+              if (t.type !== 'eof') {
+                tokens.push(t);
+              }
+            }
+          }
+        }
         continue;
       }
       const defMatch = directive.match(/^#\s*define\s+([A-Za-z_]\w*)(?:\s+(.+))?$/);
