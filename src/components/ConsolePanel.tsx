@@ -1,13 +1,16 @@
 import {
   forwardRef,
+  useCallback,
   useEffect,
   useImperativeHandle,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
   type FormEvent,
   type KeyboardEvent,
 } from 'react';
+import { createPortal } from 'react-dom';
 import {
   AlertCircle,
   AlertTriangle,
@@ -27,6 +30,7 @@ import {
 } from 'lucide-react';
 import type { CompilerDiagnostic, ConsoleChunk, RunStatus } from '../types/compiler';
 import { summarizeDiagnostics } from '../utils/diagnostics';
+import { computePortalDropdownPosition, type PortalDropdownRect } from '../utils/layout';
 import type { VirtualFile } from '../vfs/types';
 import { formatFileSize, isBinaryFileName, isCppSyntaxFile } from '../vfs/vfsHelpers';
 import { HexDumpView } from './HexDumpView';
@@ -85,11 +89,13 @@ export const ConsolePanel = forwardRef<ConsolePanelHandle, ConsolePanelProps>(fu
   const [errorViewMode, setErrorViewMode] = useState<'parsed' | 'raw'>('parsed');
   const [warningsExpanded, setWarningsExpanded] = useState(false);
   const [hexMenuOpen, setHexMenuOpen] = useState(false);
+  const [hexMenuRect, setHexMenuRect] = useState<PortalDropdownRect | null>(null);
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
   const commandInputRef = useRef<HTMLInputElement | null>(null);
-  const hexMenuRef = useRef<HTMLDivElement | null>(null);
+  const hexTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const hexPortalRef = useRef<HTMLDivElement | null>(null);
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -98,26 +104,46 @@ export const ConsolePanel = forwardRef<ConsolePanelHandle, ConsolePanelProps>(fu
     };
   }, []);
 
-  // Close Hex-дамп dropdown on outside click or Escape
+  const updateHexMenuPosition = useCallback(() => {
+    const triggerEl = hexTriggerRef.current;
+    if (!triggerEl) return;
+    const rect = triggerEl.getBoundingClientRect();
+    setHexMenuRect(
+      computePortalDropdownPosition(rect, 272, window.innerWidth, window.innerHeight, 8)
+    );
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!hexMenuOpen) return;
+    updateHexMenuPosition();
+  }, [hexMenuOpen, updateHexMenuPosition, files.length]);
+
+  // Keep portal dropdown anchored on resize/scroll and close on outside click or Escape
   useEffect(() => {
     if (!hexMenuOpen) return;
     const onPointerDown = (e: MouseEvent) => {
-      if (hexMenuRef.current && !hexMenuRef.current.contains(e.target as Node)) {
-        setHexMenuOpen(false);
-      }
+      const target = e.target as Node;
+      if (hexTriggerRef.current?.contains(target)) return;
+      if (hexPortalRef.current?.contains(target)) return;
+      setHexMenuOpen(false);
     };
     const onKeyDown = (e: globalThis.KeyboardEvent) => {
       if (e.key === 'Escape') {
         setHexMenuOpen(false);
       }
     };
+    const onViewportChange = () => updateHexMenuPosition();
     window.addEventListener('mousedown', onPointerDown);
     window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('resize', onViewportChange);
+    window.addEventListener('scroll', onViewportChange, true);
     return () => {
       window.removeEventListener('mousedown', onPointerDown);
       window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('resize', onViewportChange);
+      window.removeEventListener('scroll', onViewportChange, true);
     };
-  }, [hexMenuOpen]);
+  }, [hexMenuOpen, updateHexMenuPosition]);
 
   const summary = useMemo(() => summarizeDiagnostics(diagnostics), [diagnostics]);
 
@@ -282,36 +308,56 @@ export const ConsolePanel = forwardRef<ConsolePanelHandle, ConsolePanelProps>(fu
             </button>
           )}
 
-          {/* Compact Hex-дамп file selector dropdown */}
-          <div ref={hexMenuRef} className="relative">
-            <button
-              type="button"
-              data-testid="console-hexdump-trigger"
-              aria-label="Hex-дамп файла"
-              aria-haspopup="menu"
-              aria-expanded={hexMenuOpen}
-              title="Показать Hex-дамп файла в консоли"
-              onClick={() => setHexMenuOpen((prev) => !prev)}
-              className={`inline-flex min-h-[44px] min-w-[44px] items-center justify-center gap-1 rounded-md px-2 text-xs font-medium transition-colors whitespace-nowrap ${
-                hexMenuOpen
-                  ? 'bg-[var(--app-accent-soft)] text-[var(--app-text)]'
-                  : 'text-[var(--app-text-secondary)] hover:bg-[var(--app-hover)] hover:text-[var(--app-text)]'
-              }`}
-            >
-              <Binary className="h-3.5 w-3.5 shrink-0" />
-              <span className="hidden min-[460px]:inline">Hex-дамп</span>
-              <ChevronDown className="h-3 w-3 shrink-0 opacity-75" />
-            </button>
+          {/* Compact Hex-дамп file selector dropdown (rendered via Portal over everything) */}
+          <button
+            ref={hexTriggerRef}
+            type="button"
+            data-testid="console-hexdump-trigger"
+            aria-label="Hex-дамп файла"
+            aria-haspopup="menu"
+            aria-expanded={hexMenuOpen}
+            title="Показать Hex-дамп файла в консоли"
+            onClick={() => {
+              if (!hexMenuOpen && hexTriggerRef.current) {
+                const rect = hexTriggerRef.current.getBoundingClientRect();
+                setHexMenuRect(
+                  computePortalDropdownPosition(rect, 272, window.innerWidth, window.innerHeight, 8)
+                );
+              }
+              setHexMenuOpen((prev) => !prev);
+            }}
+            className={`inline-flex min-h-[44px] min-w-[44px] items-center justify-center gap-1 rounded-md px-2 text-xs font-medium transition-colors whitespace-nowrap ${
+              hexMenuOpen
+                ? 'bg-[var(--app-accent-soft)] text-[var(--app-text)]'
+                : 'text-[var(--app-text-secondary)] hover:bg-[var(--app-hover)] hover:text-[var(--app-text)]'
+            }`}
+          >
+            <Binary className="h-3.5 w-3.5 shrink-0" />
+            <span className="hidden min-[460px]:inline">Hex-дамп</span>
+            <ChevronDown className="h-3 w-3 shrink-0 opacity-75" />
+          </button>
 
-            {hexMenuOpen && (
+          {hexMenuOpen &&
+            hexMenuRect &&
+            typeof document !== 'undefined' &&
+            createPortal(
               <div
+                ref={hexPortalRef}
                 role="menu"
                 aria-label="Выбор файла для Hex-дампа"
                 data-testid="console-hexdump-menu"
-                className="absolute right-0 top-full z-30 mt-1 max-h-72 w-64 max-w-[85vw] overflow-y-auto rounded-lg border border-[var(--app-border-strong)] bg-[var(--app-elevated)] p-1 shadow-xl"
+                style={{
+                  position: 'fixed',
+                  top: `${hexMenuRect.top}px`,
+                  left: `${hexMenuRect.left}px`,
+                  width: `${hexMenuRect.width}px`,
+                  maxHeight: `${hexMenuRect.maxHeight}px`,
+                  zIndex: 9999,
+                }}
+                className="overflow-y-auto rounded-lg border border-[var(--app-border-strong)] bg-[var(--app-elevated)] p-1 text-[var(--app-text)] shadow-2xl"
               >
                 <div className="px-2.5 py-1.5 text-[11px] font-semibold uppercase tracking-wide text-[var(--app-text-muted)]">
-                  Выбрать файл для Hex-дампа
+                  Файл для Hex-дампа
                 </div>
                 {files.length === 0 ? (
                   <div className="px-2.5 py-2 text-xs text-[var(--app-text-muted)]">
@@ -349,9 +395,9 @@ export const ConsolePanel = forwardRef<ConsolePanelHandle, ConsolePanelProps>(fu
                     );
                   })
                 )}
-              </div>
+              </div>,
+              document.body
             )}
-          </div>
 
           <button
             type="button"

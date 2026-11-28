@@ -12,6 +12,7 @@ import {
 import { CodeEditor, type CodeEditorHandle } from './components/CodeEditor';
 import { ConsolePanel, type ConsolePanelHandle } from './components/ConsolePanel';
 import { OfflineIndicator } from './components/OfflineIndicator';
+import { SettingsModal } from './components/SettingsModal';
 import { ShortcutsModal } from './components/ShortcutsModal';
 import { TopBar } from './components/TopBar';
 import { WorkspaceSidebar } from './components/WorkspaceSidebar';
@@ -45,7 +46,9 @@ import { summarizeDiagnostics } from './utils/diagnostics';
 import { formatCppCode } from './utils/formatCpp';
 import {
   clampSplitRatio,
+  clampTopEdgeOffset,
   getDefaultSplitRatio,
+  parseTopEdgeOffset,
   resolveEffectiveLayout,
   resolveWordWrap,
   type WordWrapPreference,
@@ -70,6 +73,7 @@ import {
   deleteFolderPaths,
   detectLanguageFromFileName,
   formatCanonicalHexDumpText,
+  getNewFileInitialContent,
   getParentFolderPaths,
   isBinaryFileName,
   isCppSyntaxFile,
@@ -97,6 +101,7 @@ const STORAGE_KEYS = {
   lastSavedAt: 'cppstudio.lastSavedAt',
   activeFile: 'cppstudio.activeFile',
   sidebarOpen: 'cppstudio.sidebarOpen',
+  topEdgeOffset: 'cppstudio.topEdgeOffset',
 };
 
 const DEFAULT_INPUT_TXT = '10 20 30\nПривет из виртуальной рабочей области!\n';
@@ -216,6 +221,10 @@ export default function App() {
   });
   const [activeTab, setActiveTab] = useState<'editor' | 'console'>('editor');
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [topEdgeOffset, setTopEdgeOffset] = useState<number>(() =>
+    parseTopEdgeOffset(safeReadStorage(STORAGE_KEYS.topEdgeOffset, '0'))
+  );
   const [formattedFeedback, setFormattedFeedback] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
 
@@ -522,6 +531,10 @@ export default function App() {
   useEffect(() => {
     safeWriteStorage(STORAGE_KEYS.splitRatio, splitRatio.toFixed(4));
   }, [splitRatio]);
+
+  useEffect(() => {
+    safeWriteStorage(STORAGE_KEYS.topEdgeOffset, String(topEdgeOffset));
+  }, [topEdgeOffset]);
 
   // Immediately flush active file when page is hidden/unloaded (vital for iPad Safari / PWA suspension)
   useEffect(() => {
@@ -900,7 +913,8 @@ export default function App() {
       }
       flushActiveEditorBuffer();
       const now = Date.now();
-      const newFile = createVirtualFile(check.normalized, '', now);
+      const initialContent = getNewFileInitialContent(check.normalized);
+      const newFile = createVirtualFile(check.normalized, initialContent, now);
       const nextMap = { ...filesRef.current, [newFile.name]: newFile };
       filesRef.current = nextMap;
       setFilesMap(nextMap);
@@ -1627,7 +1641,9 @@ export default function App() {
 
   return (
     <div
-      className={`flex h-dvh w-full flex-col overflow-hidden bg-[var(--app-bg)] text-[var(--app-text)] ${
+      data-testid="app-root"
+      style={topEdgeOffset > 0 ? { paddingTop: `${topEdgeOffset}px` } : undefined}
+      className={`box-border flex h-dvh w-full flex-col overflow-hidden bg-[var(--app-surface)] text-[var(--app-text)] transition-[padding-top] duration-150 ${
         isDragging
           ? effectiveLayout === 'side-by-side'
             ? 'select-none cursor-col-resize'
@@ -1673,6 +1689,7 @@ export default function App() {
         onDownloadCode={handleDownloadActiveFile}
         onImportFiles={handleImportFiles}
         onOpenShortcuts={() => setShortcutsOpen(true)}
+        onOpenSettings={() => setSettingsOpen(true)}
         offlineReady={offlineReady}
         isOnline={isOnline}
       />
@@ -1983,6 +2000,13 @@ export default function App() {
       </div>
 
       <ShortcutsModal open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
+
+      <SettingsModal
+        open={settingsOpen}
+        topEdgeOffset={topEdgeOffset}
+        onChangeTopEdgeOffset={(val) => setTopEdgeOffset(clampTopEdgeOffset(val))}
+        onClose={() => setSettingsOpen(false)}
+      />
 
       <OfflineIndicator
         isOnline={isOnline}

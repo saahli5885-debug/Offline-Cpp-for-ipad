@@ -63,3 +63,53 @@ export function getDefaultSplitRatio(viewportWidth: number): number {
   if (viewportWidth >= 1100) return 0.56; // Desktop 1440 & iPad Air 11" full screen
   return 0.54;
 }
+
+export const MIN_TOP_EDGE_OFFSET = 0;
+export const MAX_TOP_EDGE_OFFSET = 64;
+
+export function clampTopEdgeOffset(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.round(Math.min(MAX_TOP_EDGE_OFFSET, Math.max(MIN_TOP_EDGE_OFFSET, value)));
+}
+
+export function parseTopEdgeOffset(raw: string): number {
+  if (!raw) return 0;
+  const parsed = Number.parseInt(raw, 10);
+  return clampTopEdgeOffset(parsed);
+}
+
+export interface PortalDropdownRect {
+  top: number;
+  left: number;
+  width: number;
+  maxHeight: number;
+}
+
+/**
+ * Computes fixed viewport coordinates for a portal dropdown anchored below a trigger,
+ * clamped within viewport bounds with padding so it never clips off-screen on iPad Split View.
+ */
+export function computePortalDropdownPosition(
+  triggerRect: { left: number; right: number; bottom: number },
+  preferredWidth: number,
+  viewportWidth: number,
+  viewportHeight: number,
+  padding = 8
+): PortalDropdownRect {
+  const maxAvailableWidth = Math.max(180, viewportWidth - padding * 2);
+  const width = Math.min(preferredWidth, maxAvailableWidth);
+  const maxLeft = Math.max(padding, viewportWidth - width - padding);
+  const left = Math.min(Math.max(padding, triggerRect.left), maxLeft);
+  const rawTop = triggerRect.bottom + 4;
+  const maxTop = Math.max(padding, viewportHeight - 148 - padding);
+  const top = Math.min(Math.max(padding, rawTop), maxTop);
+  const maxHeight = Math.max(140, Math.min(320, viewportHeight - top - padding));
+
+  return {
+    top: Math.round(top),
+    left: Math.round(left),
+    width: Math.round(width),
+    maxHeight: Math.round(maxHeight),
+  };
+}
+

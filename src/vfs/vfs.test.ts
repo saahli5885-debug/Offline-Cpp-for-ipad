@@ -8,9 +8,12 @@ import {
   createVirtualFile,
   createVirtualFolder,
   deleteFolderPaths,
+  DEV_CPP_C_TEMPLATE,
+  DEV_CPP_CPP_TEMPLATE,
   formatCanonicalHexDumpText,
   formatFileSize,
   formatHexDump,
+  getNewFileInitialContent,
   hasBinaryBytes,
   isBinaryFileName,
   isCppSyntaxFile,
@@ -241,4 +244,30 @@ test('hierarchical folder tree, validation, rename, and delete maintain strict i
   assert.equal('empty_dir' in deleted.nextFoldersMap, true);
   assert.equal('main.cpp' in deleted.nextFilesMap, true);
 });
+
+test('getNewFileInitialContent returns exact Dev-C++ templates for .c and .cpp/.cc/.cxx and empty string for other extensions', () => {
+  assert.equal(getNewFileInitialContent('main2.c'), DEV_CPP_C_TEMPLATE);
+  assert.equal(getNewFileInitialContent('lab7/TASK.C'), DEV_CPP_C_TEMPLATE);
+  assert.equal(
+    DEV_CPP_C_TEMPLATE,
+    '#include <stdio.h>\n\nint main(int argc, char** argv) {\n\t\n\treturn 0;\n}\n'
+  );
+
+  assert.equal(getNewFileInitialContent('solve.cpp'), DEV_CPP_CPP_TEMPLATE);
+  assert.equal(getNewFileInitialContent('lab7/MAIN.CPP'), DEV_CPP_CPP_TEMPLATE);
+  assert.equal(getNewFileInitialContent('algo.cc'), DEV_CPP_CPP_TEMPLATE);
+  assert.equal(getNewFileInitialContent('algo.cxx'), DEV_CPP_CPP_TEMPLATE);
+  assert.equal(
+    DEV_CPP_CPP_TEMPLATE,
+    '#include <iostream>\n\nusing namespace std;\n\nint main(int argc, char** argv) {\n\t\n\treturn 0;\n}\n'
+  );
+
+  assert.equal(getNewFileInitialContent('input.txt'), '');
+  assert.equal(getNewFileInitialContent('header.h'), '');
+  assert.equal(getNewFileInitialContent('header.hpp'), '');
+  assert.equal(getNewFileInitialContent('data.bin'), '');
+  assert.equal(getNewFileInitialContent('records.dat'), '');
+  assert.equal(getNewFileInitialContent('README'), '');
+});
+
 

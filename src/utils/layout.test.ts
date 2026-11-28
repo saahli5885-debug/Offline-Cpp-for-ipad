@@ -2,7 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   clampSplitRatio,
+  clampTopEdgeOffset,
+  computePortalDropdownPosition,
   getDefaultSplitRatio,
+  parseTopEdgeOffset,
   resolveEffectiveLayout,
   resolveWordWrap,
 } from './layout';
@@ -50,3 +53,39 @@ test('clamps split ratio within safe bounds and adapts defaults', () => {
   assert.equal(getDefaultSplitRatio(1920), 0.58);
   assert.equal(getDefaultSplitRatio(1180), 0.56);
 });
+
+test('clamps and parses iPadOS top edge offset cleanly between 0 and 64 px', () => {
+  assert.equal(parseTopEdgeOffset(''), 0);
+  assert.equal(parseTopEdgeOffset('0'), 0);
+  assert.equal(parseTopEdgeOffset('36'), 36);
+  assert.equal(parseTopEdgeOffset('999'), 64);
+  assert.equal(parseTopEdgeOffset('-12'), 0);
+  assert.equal(parseTopEdgeOffset('not-a-number'), 0);
+  assert.equal(clampTopEdgeOffset(24.4), 24);
+});
+
+test('computePortalDropdownPosition clamps fixed coordinates within viewport bounds with 8px padding', () => {
+  // Trigger near right edge of iPad Split View (e.g. left=460 on 585px viewport)
+  const nearRight = computePortalDropdownPosition(
+    { left: 460, right: 560, bottom: 96 },
+    272,
+    585,
+    820,
+    8
+  );
+  assert.equal(nearRight.top, 100);
+  assert.equal(nearRight.left + nearRight.width <= 585 - 8, true);
+  assert.equal(nearRight.left >= 8, true);
+
+  // Trigger near left edge of console pane on desktop (never clips negative or left)
+  const nearLeft = computePortalDropdownPosition(
+    { left: 2, right: 90, bottom: 96 },
+    272,
+    1180,
+    820,
+    8
+  );
+  assert.equal(nearLeft.left, 8);
+  assert.equal(nearLeft.width, 272);
+});
+

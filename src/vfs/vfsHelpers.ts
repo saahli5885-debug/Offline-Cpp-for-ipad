@@ -398,6 +398,23 @@ export function isEntrySourceFile(name: string): boolean {
   return norm === 'main.cpp' || norm === 'main.c';
 }
 
+export const DEV_CPP_C_TEMPLATE =
+  '#include <stdio.h>\n\nint main(int argc, char** argv) {\n\t\n\treturn 0;\n}\n';
+
+export const DEV_CPP_CPP_TEMPLATE =
+  '#include <iostream>\n\nusing namespace std;\n\nint main(int argc, char** argv) {\n\t\n\treturn 0;\n}\n';
+
+/**
+ * Returns Dev-C++ style starter code when creating new .c or .cpp/.cc/.cxx files,
+ * leaving all other file extensions (.txt, .h, .bin, .dat, etc.) completely empty.
+ */
+export function getNewFileInitialContent(fileName: string): string {
+  const ext = getFileExtension(fileName);
+  if (ext === 'c') return DEV_CPP_C_TEMPLATE;
+  if (ext === 'cpp' || ext === 'cc' || ext === 'cxx') return DEV_CPP_CPP_TEMPLATE;
+  return '';
+}
+
 export function computeByteSize(content: string | Uint8Array): number {
   if (content instanceof Uint8Array) return content.byteLength;
   return encodeUtf8(content).byteLength;

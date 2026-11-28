@@ -17,6 +17,7 @@ import {
   Play,
   Plus,
   Rows2,
+  Settings,
   Square,
   Upload,
 } from 'lucide-react';
@@ -86,6 +87,7 @@ interface TopBarProps {
   onDownloadCode: () => void;
   onImportFiles: (files: FileList) => void;
   onOpenShortcuts: () => void;
+  onOpenSettings: () => void;
   offlineReady: boolean;
   isOnline: boolean;
 }
@@ -122,6 +124,7 @@ export function TopBar({
   onDownloadCode,
   onImportFiles,
   onOpenShortcuts,
+  onOpenSettings,
   offlineReady,
   isOnline,
 }: TopBarProps) {
@@ -262,7 +265,7 @@ export function TopBar({
           </button>
         </div>
 
-        <label className="hidden min-[520px]:block shrink-0">
+        <label className="hidden sm:block shrink-0">
           <span className="sr-only">Стандарт компилятора</span>
           <select
             aria-label="Стандарт компилятора"
@@ -438,11 +441,11 @@ export function TopBar({
           <Download className="h-4 w-4" />
         </button>
 
-        {/* PWA Install / Offline guide (auto-hides in standalone mode; inside More menu on <480px) */}
+        {/* PWA Install / Offline guide (auto-hides in standalone mode; inside More menu on < sm) */}
         <PWAInstallButton
           offlineReady={offlineReady}
           isOnline={isOnline}
-          className="hidden min-[480px]:inline-flex"
+          className="hidden sm:inline-flex"
         />
 
         {/* Multi-Theme Selector (6 curated IDE themes; also in More menu on <430px) */}
@@ -567,6 +570,18 @@ export function TopBar({
           )}
         </div>
 
+        {/* Settings modal trigger (>= 44px touch target, always reachable from TopBar) */}
+        <button
+          type="button"
+          data-testid="open-settings-button"
+          onClick={onOpenSettings}
+          aria-label="Настройки"
+          title="Настройки (Верхний отступ iPadOS)"
+          className="inline-flex h-11 w-11 items-center justify-center rounded-lg border border-[var(--app-border-strong)] bg-[var(--app-elevated)] text-[var(--app-text-secondary)] transition-colors hover:bg-[var(--app-hover)] hover:text-[var(--app-text)] shrink-0"
+        >
+          <Settings className="h-4 w-4" />
+        </button>
+
         {/* Overflow menu ONLY when secondary actions are collapsed (< xl) */}
         <div ref={moreMenuRef} className="relative xl:hidden">
           <button
@@ -585,8 +600,8 @@ export function TopBar({
               role="menu"
               className="absolute right-0 z-30 mt-1.5 max-h-[75dvh] w-64 overflow-y-auto rounded-xl border border-[var(--app-border-strong)] bg-[var(--app-surface)] p-1.5 shadow-lg"
             >
-              {/* Standard selector on narrow screens (< 520px) */}
-              <div className="flex items-center justify-between px-2.5 py-2 min-[520px]:hidden">
+              {/* Standard selector on narrow screens (< sm) */}
+              <div className="flex items-center justify-between px-2.5 py-2 sm:hidden">
                 <span className="text-xs text-[var(--app-text-secondary)]">Стандарт</span>
                 <select
                   aria-label="Стандарт компилятора в меню"
@@ -673,6 +688,19 @@ export function TopBar({
                 type="button"
                 role="menuitem"
                 onClick={() => {
+                  onOpenSettings();
+                  setMoreOpen(false);
+                }}
+                className="flex min-h-[44px] w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-xs font-medium text-[var(--app-text)] hover:bg-[var(--app-hover)]"
+              >
+                <Settings className="h-3.5 w-3.5 text-[var(--app-text-secondary)]" />
+                <span>Настройки (Верхний отступ iPadOS)</span>
+              </button>
+
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
                   onOpenShortcuts();
                   setMoreOpen(false);
                 }}
@@ -686,7 +714,7 @@ export function TopBar({
                 offlineReady={offlineReady}
                 isOnline={isOnline}
                 variant="menuitem"
-                className="flex min-[480px]:hidden"
+                className="flex sm:hidden"
                 onActionComplete={() => setMoreOpen(false)}
               />
 
